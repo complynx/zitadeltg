@@ -1,0 +1,58 @@
+listen: ":8080"
+public_url: "https://telegram-idp.example.com"
+issuer: "https://telegram-idp.example.com"
+email_domain: "telegram.invalid"
+state_ttl: "10m"
+
+zitadel:
+  jwt_endpoint: "https://accounts.example.com/idps/jwt"
+  jwt_header: "x-telegram-idp-jwt"
+  # Same-origin redirects are always accepted. List every additional application origin.
+  redirect_origins:
+    - "https://app.example.com"
+  # Avoid this unless ZITADEL is the sole redirect-policy enforcement point.
+  allow_any_redirect_origin: false
+
+jwt:
+  ttl: "2m"
+  key_id: "zitadeltg-2026-01"
+  # If the file does not exist, zitadeltg creates a 2048-bit RSA key with 0600 permissions.
+  private_key_file: "./zitadeltg-rsa.pem"
+  # private_key: "${ZITADELTG_PRIVATE_KEY_PEM}"
+  # Configure the same audience on the ZITADEL JWT IdP. Defaults to jwt_endpoint.
+  audience: "https://accounts.example.com/idps/jwt"
+
+telegram:
+  issuer: "https://oauth.telegram.org"
+  jwks_url: "https://oauth.telegram.org/.well-known/jwks.json"
+  jwks_cache_ttl: "1h"
+  clock_skew: "30s"
+
+proxy:
+  # Trust only your Traefik container/network CIDRs for X-Forwarded-* headers.
+  # Keep this narrow if the service is reachable by anything other than Traefik.
+  trusted_cidrs:
+    - "127.0.0.1/32"
+    - "::1/128"
+    - "172.18.0.2/32" # Replace with the exact Traefik address or deployment CIDR.
+  secure_cookies: true
+
+rate_limit:
+  login:
+    requests: 60
+    window: "1m"
+  auth:
+    requests: 20
+    window: "1m"
+
+bots:
+  - token: "${TELEGRAM_BOT_MAIN}"
+    name: "main_example_bot"
+    write: true
+    phone: false
+    lang: "en"
+  - token: "${TELEGRAM_BOT_SUPPORT}"
+    name: "support_example_bot"
+    write: false
+    phone: true
+    lang: "en"

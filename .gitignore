@@ -26,6 +26,10 @@ go.work.sum
 
 # env file
 .env
+config.yaml
+*.pem
+*.key
+*.local.*
 
 # Editor/IDE
 # .idea/
