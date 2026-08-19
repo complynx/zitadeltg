@@ -35,6 +35,7 @@ bots:
 	require.NoError(t, err)
 	assert.Equal(t, ":9000", cfg.Listen)
 	assert.Equal(t, "x-test-jwt", cfg.Zitadel.JWTHeader)
+	assert.Equal(t, defaultZitadelUserAgentCookie, cfg.Zitadel.UserAgentCookie)
 	assert.Equal(t, defaultJWTPrivateKeyFile, cfg.JWT.PrivateKeyFile)
 	require.Len(t, cfg.Bots, 1)
 	bot := cfg.Bots[0]
@@ -45,6 +46,50 @@ bots:
 	assert.False(t, bot.RequestPhone)
 	assert.False(t, cfg.SyntheticEmailVerified)
 	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
+}
+
+func TestParseConfigAcceptsCustomZitadelUserAgentCookie(t *testing.T) {
+	t.Setenv("ZITADEL_UA_COOKIE", "zitadel.custom-useragent")
+	cfg, err := ParseConfig([]byte(`
+issuer: "https://idp.example.com"
+zitadel:
+  jwt_endpoint: "https://accounts.example.com/idps/jwt"
+  user_agent_cookie: "${ZITADEL_UA_COOKIE}"
+bots:
+  - token: "123456789:secret"
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "zitadel.custom-useragent", cfg.Zitadel.UserAgentCookie)
+}
+
+func TestParseConfigRejectsUnsafeZitadelUserAgentCookie(t *testing.T) {
+	_, err := ParseConfig([]byte(`
+issuer: "https://idp.example.com"
+zitadel:
+  jwt_endpoint: "https://accounts.example.com/idps/jwt"
+  user_agent_cookie: "bad cookie"
+bots:
+  - token: "123456789:secret"
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "safe cookie name")
+}
+
+func TestParseConfigRejectsZitadeltgSessionAsUserAgentCookie(t *testing.T) {
+	for _, cookieName := range []string{secureSessionCookieName, insecureSessionCookieName} {
+		t.Run(cookieName, func(t *testing.T) {
+			_, err := ParseConfig([]byte(`
+issuer: "https://idp.example.com"
+zitadel:
+  jwt_endpoint: "https://accounts.example.com/idps/jwt"
+  user_agent_cookie: "` + cookieName + `"
+bots:
+  - token: "123456789:secret"
+`))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "must not reuse")
+		})
+	}
 }
 
 func TestParseConfigAcceptsDebugLogLevel(t *testing.T) {

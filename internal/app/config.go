@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	defaultJWTPrivateKeyFile = "/data/zitadeltg-rsa.pem"
-	defaultTelegramIssuer    = "https://oauth.telegram.org"
-	defaultTelegramJWKSURL   = "https://oauth.telegram.org/.well-known/jwks.json"
+	defaultJWTPrivateKeyFile      = "/data/zitadeltg-rsa.pem"
+	defaultTelegramIssuer         = "https://oauth.telegram.org"
+	defaultTelegramJWKSURL        = "https://oauth.telegram.org/.well-known/jwks.json"
+	defaultZitadelUserAgentCookie = "__Host-zitadel.useragent"
 )
 
 type Config struct {
@@ -42,6 +43,7 @@ type Config struct {
 type ZitadelConfig struct {
 	JWTEndpoint            string
 	JWTHeader              string
+	UserAgentCookie        string
 	RedirectOrigins        []string
 	AllowAnyRedirectOrigin bool
 }
@@ -119,6 +121,7 @@ type rawTopLevelAliases struct {
 type rawZitadelConfig struct {
 	JWTEndpoint            string   `yaml:"jwt_endpoint"`
 	JWTHeader              string   `yaml:"jwt_header"`
+	UserAgentCookie        string   `yaml:"user_agent_cookie"`
 	RedirectOrigins        []string `yaml:"redirect_origins"`
 	AllowAnyRedirectOrigin bool     `yaml:"allow_any_redirect_origin"`
 }
@@ -202,7 +205,8 @@ func ParseConfig(input []byte) (Config, error) {
 		EmailDomain: "telegram.invalid",
 		StateTTL:    "10m",
 		Zitadel: rawZitadelConfig{
-			JWTHeader: "x-zitadel-jwt",
+			JWTHeader:       "x-zitadel-jwt",
+			UserAgentCookie: defaultZitadelUserAgentCookie,
 		},
 		JWT: rawJWTConfig{
 			TTL:   "2m",
@@ -262,6 +266,7 @@ func (raw *rawConfig) expandEnv() error {
 		&raw.StateTTL,
 		&raw.Zitadel.JWTEndpoint,
 		&raw.Zitadel.JWTHeader,
+		&raw.Zitadel.UserAgentCookie,
 		&raw.JWT.TTL,
 		&raw.JWT.KeyID,
 		&raw.JWT.PrivateKeyFile,
@@ -442,6 +447,7 @@ func finalizeConfig(raw rawConfig) (Config, error) {
 		Zitadel: ZitadelConfig{
 			JWTEndpoint:            strings.TrimSpace(raw.Zitadel.JWTEndpoint),
 			JWTHeader:              strings.TrimSpace(raw.Zitadel.JWTHeader),
+			UserAgentCookie:        strings.TrimSpace(raw.Zitadel.UserAgentCookie),
 			RedirectOrigins:        redirectOrigins,
 			AllowAnyRedirectOrigin: raw.Zitadel.AllowAnyRedirectOrigin,
 		},
@@ -487,6 +493,9 @@ func finalizeConfig(raw rawConfig) (Config, error) {
 	}
 	if cfg.Zitadel.JWTHeader == "" {
 		return Config{}, errors.New("zitadel.jwt_header is required")
+	}
+	if cfg.Zitadel.UserAgentCookie == "" {
+		return Config{}, errors.New("zitadel.user_agent_cookie is required")
 	}
 	if cfg.JWT.KeyID == "" {
 		return Config{}, errors.New("jwt.key_id is required")
@@ -550,6 +559,13 @@ func finalizeConfig(raw rawConfig) (Config, error) {
 	}
 	if !validJWTHeaderName(cfg.Zitadel.JWTHeader) {
 		return Config{}, fmt.Errorf("zitadel.jwt_header %q is not a safe HTTP header name", cfg.Zitadel.JWTHeader)
+	}
+	if !validHTTPHeaderName(cfg.Zitadel.UserAgentCookie) {
+		return Config{}, fmt.Errorf("zitadel.user_agent_cookie %q is not a safe cookie name", cfg.Zitadel.UserAgentCookie)
+	}
+	switch cfg.Zitadel.UserAgentCookie {
+	case secureSessionCookieName, insecureSessionCookieName:
+		return Config{}, errors.New("zitadel.user_agent_cookie must not reuse a zitadeltg session cookie name")
 	}
 	if !validEmailDomain(cfg.EmailDomain) {
 		return Config{}, fmt.Errorf("email_domain %q is not valid", cfg.EmailDomain)

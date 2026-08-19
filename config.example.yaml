@@ -1,7 +1,7 @@
 listen: ":8080"
 log_level: "info"
-public_url: "https://telegram-idp.example.com"
-issuer: "https://telegram-idp.example.com"
+public_url: "https://accounts.example.com/tg"
+issuer: "https://accounts.example.com/tg"
 email_domain: "telegram.invalid"
 # ZITADEL Login V1 requires a verified email before completing authentication.
 # Enable only with the reserved .invalid domain and keep email auto-linking disabled.
@@ -12,6 +12,9 @@ zitadel:
   # ZITADEL v4.15.0 Login V1 callback.
   jwt_endpoint: "https://accounts.example.com/ui/login/login/jwt/authorize"
   jwt_header: "x-telegram-idp-jwt"
+  # Must match ZITADEL UserAgentCookie.Name. The default is host-only, so expose
+  # zitadeltg under the same HTTPS hostname as ZITADEL (for example under /tg).
+  user_agent_cookie: "__Host-zitadel.useragent"
   # Same-origin redirects are always accepted. List every additional application origin.
   redirect_origins:
     - "https://app.example.com"

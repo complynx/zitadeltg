@@ -477,6 +477,14 @@ func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt stri
 		return fmt.Errorf("create ZITADEL request: %w", err)
 	}
 	req.Header.Set(s.cfg.Zitadel.JWTHeader, jwt)
+	// ZITADEL binds the auth request to the encrypted user-agent ID in this
+	// cookie. Forward only that cookie so its middleware does not mint a new ID
+	// for the server-side JWT callback. Never forward the rest of the browser's
+	// cookie jar, which includes zitadeltg's own login session.
+	userAgent, forwardUserAgent := s.zitadelUserAgentCookie(r, target)
+	if forwardUserAgent {
+		req.AddCookie(&http.Cookie{Name: userAgent.Name, Value: userAgent.Value})
+	}
 	if accept := r.Header.Get("Accept"); accept != "" {
 		req.Header.Set("Accept", accept)
 	}
@@ -502,10 +510,13 @@ func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt stri
 			classification = classifyZitadelResponse(resp.Header.Get("Content-Type"), diagnosticBody)
 		}
 		registrationShape := isZitadelRegistrationForm(body, resp.Header.Get("Content-Type"), resp.StatusCode)
+		if readErr == nil && !responseTruncated && registrationShape && !forwardUserAgent {
+			classification = "user_agent_cookie_missing_or_invalid"
+		}
 		recognizedRegistration := readErr == nil && !responseTruncated && registrationShape
 		sensitiveRegistration := registrationShape || isPotentialZitadelRegistration(body)
 		relayRegistration := readErr == nil && !responseTruncated &&
-			recognizedRegistration && s.registrationOriginAllowed(r, target)
+			recognizedRegistration && forwardUserAgent && s.registrationOriginAllowed(r, target)
 		if s.logger != nil && s.logger.Enabled(r.Context(), slog.LevelDebug) {
 			requestID := resp.Header.Get("X-Request-ID")
 			if !upstreamRequestIDLogRe.MatchString(requestID) {
@@ -518,6 +529,7 @@ func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt stri
 				slog.Bool("response_truncated", responseTruncated),
 				slog.Bool("diagnostic_truncated", diagnosticTruncated),
 				slog.Bool("response_read_failed", readErr != nil),
+				slog.Bool("user_agent_cookie_forwarded", forwardUserAgent),
 				slog.String("classification", classification),
 				slog.Bool("registration_sensitive", sensitiveRegistration),
 				slog.Bool("registration_relayed", relayRegistration),
@@ -565,6 +577,28 @@ func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt stri
 	// GET so an upstream 307/308 can never resend that body to the destination.
 	w.WriteHeader(http.StatusSeeOther)
 	return nil
+}
+
+func (s *Server) zitadelUserAgentCookie(r *http.Request, target *url.URL) (*http.Cookie, bool) {
+	if !isSecureRequest(r, s.cfg.Proxy.TrustedCIDRs) {
+		return nil, false
+	}
+	incoming, err := url.Parse("https://" + r.Host)
+	if err != nil || incoming.Host == "" || incoming.User != nil || incoming.Path != "" ||
+		!strings.EqualFold(incoming.Hostname(), target.Hostname()) {
+		return nil, false
+	}
+	var found *http.Cookie
+	for _, cookie := range r.Cookies() {
+		if cookie.Name != s.cfg.Zitadel.UserAgentCookie {
+			continue
+		}
+		if found != nil || cookie.Value == "" {
+			return nil, false
+		}
+		found = cookie
+	}
+	return found, found != nil
 }
 
 func (s *Server) registrationOriginAllowed(r *http.Request, target *url.URL) bool {

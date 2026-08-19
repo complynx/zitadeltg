@@ -56,6 +56,16 @@ it does not constrain general route matching. Relaying the manual-registration
 form additionally requires the actual request `Host`, `public_url`, and the
 ZITADEL callback to have the same HTTPS origin.
 
+`zitadel.user_agent_cookie` defaults to ZITADEL v4.15.0's secure external
+cookie name, `__Host-zitadel.useragent`. The relay forwards only this cookie to
+ZITADEL so the server-side JWT callback retains the browser auth request's
+user-agent binding. If `UserAgentCookie.Name` is customized in ZITADEL, set the
+same name here. Because `__Host-` cookies are host-only, Login V1 requires
+zitadeltg to be exposed under the same HTTPS hostname as ZITADEL, normally under
+a dedicated path prefix. A different hostname cannot receive this browser
+cookie. The relay checks secure same-host provenance and forwards no other
+incoming cookies.
+
 `synthetic_email_verified` defaults to `false`. ZITADEL Login V1 requires a
 verified email before it completes authentication, so deployments using
 automatic external-user creation can set it to `true`. This opt-in is accepted
@@ -163,8 +173,10 @@ Create a JWT IdP in ZITADEL with:
 
 - Issuer: the configured `issuer`.
 - Header name: the configured `zitadel.jwt_header`.
-- Keys endpoint: `https://your-idp.example.com/keys`.
-- JWT endpoint: `https://your-idp.example.com/login/BOT_ID`.
+- Keys endpoint: the public zitadeltg keys route, for example
+  `https://accounts.example.com/tg/keys`.
+- JWT endpoint: the public zitadeltg login route, for example
+  `https://accounts.example.com/tg/login/BOT_ID`.
 - Audience: the configured `jwt.audience` (by default the value of
   `zitadel.jwt_endpoint`).
 

@@ -153,6 +153,7 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 
 	var receivedQuery string
 	var receivedJWT string
+	var receivedCookieHeader string
 	zitadelCalls := 0
 	client := fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.Host {
@@ -162,6 +163,7 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 			zitadelCalls++
 			receivedQuery = req.URL.RawQuery
 			receivedJWT = req.Header.Get("x-test-jwt")
+			receivedCookieHeader = req.Header.Get("Cookie")
 			return &http.Response{
 				StatusCode: http.StatusFound,
 				Header: http.Header{
@@ -182,12 +184,14 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 
 	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/idps/jwt")
 	cfg.Zitadel.JWTHeader = "x-test-jwt"
+	cfg.PublicURL = "https://zitadel.test/tg"
+	cfg.Issuer = cfg.PublicURL
 	idpSigner := newTestSigner(t, "idp-key")
 	srv, err := NewServer(context.Background(), cfg, idpSigner, client)
 	require.NoError(t, err)
 
 	bot := cfg.Bots[0]
-	loginReq := httptest.NewRequest(http.MethodGet, "/prefix/login/"+bot.ID+"?requestID=abc&foo=bar", nil)
+	loginReq := httptest.NewRequest(http.MethodGet, "https://zitadel.test/prefix/login/"+bot.ID+"?requestID=abc&foo=bar", nil)
 	loginRR := httptest.NewRecorder()
 	srv.ServeHTTP(loginRR, loginReq)
 	require.Equal(t, http.StatusOK, loginRR.Code)
@@ -218,9 +222,11 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 		"id_token": {idToken},
 		"state":    {state},
 	}
-	req := httptest.NewRequest(http.MethodPost, "/prefix/auth/telegram/"+bot.ID, strings.NewReader(form.Encode()))
+	req := httptest.NewRequest(http.MethodPost, "https://zitadel.test/prefix/auth/telegram/"+bot.ID, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.AddCookie(sessionCookie)
+	req.AddCookie(&http.Cookie{Name: defaultZitadelUserAgentCookie, Value: "encrypted-user-agent"})
+	req.AddCookie(&http.Cookie{Name: "unrelated", Value: "must-not-be-forwarded"})
 	rr := httptest.NewRecorder()
 	srv.ServeHTTP(rr, req)
 
@@ -229,6 +235,9 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 	assert.NotContains(t, strings.Join(rr.Header().Values("Set-Cookie"), ";"), "zitadel_session")
 	assert.Empty(t, rr.Header().Get("X-Internal"))
 	assert.Equal(t, "foo=bar&requestID=abc", receivedQuery)
+	assert.Equal(t, defaultZitadelUserAgentCookie+"=encrypted-user-agent", receivedCookieHeader)
+	assert.NotContains(t, receivedCookieHeader, sessionCookie.Name)
+	assert.NotContains(t, receivedCookieHeader, "unrelated")
 	require.NotEmpty(t, receivedJWT)
 	payload := jwt.MapClaims{}
 	parsed, err := jwt.ParseWithClaims(receivedJWT, payload, func(token *jwt.Token) (any, error) {
@@ -246,7 +255,7 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 	assert.Equal(t, "15555550123", payload["phone_number"])
 	assert.Equal(t, true, payload["phone_number_verified"])
 
-	replayReq := httptest.NewRequest(http.MethodPost, "/prefix/auth/telegram/"+bot.ID, strings.NewReader(form.Encode()))
+	replayReq := httptest.NewRequest(http.MethodPost, "https://zitadel.test/prefix/auth/telegram/"+bot.ID, strings.NewReader(form.Encode()))
 	replayReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	replayReq.AddCookie(sessionCookie)
 	replayRR := httptest.NewRecorder()
@@ -616,6 +625,87 @@ func TestZitadelRelayRejectsNonRedirectBodies(t *testing.T) {
 // values populated as expected after claim propagation.
 const testZitadelRegistrationForm = `<html><form action="/ui/login/externaluser/option?none=true" method="POST"><input type="hidden" name="gorilla.csrf.Token" value="sensitive-csrf"><input type="hidden" name="authRequestID" value="sensitive-request"><input type="hidden" name="external-idp-config-id" value="provider-1"><input type="text" name="firstname" value="Jane" required><input type="text" name="lastname" value="Doe" required><button type="submit" formaction="/ui/login/externaluser/option?autoregisterbutton=true">Register</button></form></html>`
 
+func addZitadelUserAgentCookie(req *http.Request) {
+	req.AddCookie(&http.Cookie{Name: defaultZitadelUserAgentCookie, Value: "encrypted-user-agent"})
+}
+
+func TestZitadelUserAgentCookieRequiresUniqueSecureSameHostCookie(t *testing.T) {
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/ui/login/login/jwt/authorize")
+	srv := &Server{cfg: cfg}
+	target, err := url.Parse(cfg.Zitadel.JWTEndpoint)
+	require.NoError(t, err)
+	tests := []struct {
+		name      string
+		request   *http.Request
+		wantValue string
+	}{
+		{name: "missing", request: httptest.NewRequest(http.MethodPost, "https://zitadel.test/auth", nil)},
+		{name: "insecure", request: func() *http.Request {
+			r := httptest.NewRequest(http.MethodPost, "http://zitadel.test/auth", nil)
+			addZitadelUserAgentCookie(r)
+			return r
+		}()},
+		{name: "different host", request: func() *http.Request {
+			r := httptest.NewRequest(http.MethodPost, "https://idp.test/auth", nil)
+			addZitadelUserAgentCookie(r)
+			return r
+		}()},
+		{name: "duplicate", request: func() *http.Request {
+			r := httptest.NewRequest(http.MethodPost, "https://zitadel.test/auth", nil)
+			addZitadelUserAgentCookie(r)
+			r.AddCookie(&http.Cookie{Name: defaultZitadelUserAgentCookie, Value: "second"})
+			return r
+		}()},
+		{name: "empty", request: func() *http.Request {
+			r := httptest.NewRequest(http.MethodPost, "https://zitadel.test/auth", nil)
+			r.AddCookie(&http.Cookie{Name: defaultZitadelUserAgentCookie, Value: ""})
+			return r
+		}()},
+		{name: "valid", request: func() *http.Request {
+			r := httptest.NewRequest(http.MethodPost, "https://zitadel.test/auth", nil)
+			addZitadelUserAgentCookie(r)
+			return r
+		}(), wantValue: "encrypted-user-agent"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cookie, ok := srv.zitadelUserAgentCookie(tt.request, target)
+			if tt.wantValue == "" {
+				assert.False(t, ok)
+				assert.Nil(t, cookie)
+				return
+			}
+			require.True(t, ok)
+			require.NotNil(t, cookie)
+			assert.Equal(t, tt.wantValue, cookie.Value)
+		})
+	}
+}
+
+func TestZitadelRelayForwardsConfiguredUserAgentCookieName(t *testing.T) {
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/ui/login/login/jwt/authorize")
+	cfg.Zitadel.UserAgentCookie = "zitadel.custom-useragent"
+	var receivedCookieHeader string
+	srv := &Server{
+		cfg: cfg,
+		proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+			receivedCookieHeader = req.Header.Get("Cookie")
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+				Body:       io.NopCloser(strings.NewReader("expected test response")),
+			}, nil
+		}),
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "https://zitadel.test/auth", nil)
+	req.AddCookie(&http.Cookie{Name: defaultZitadelUserAgentCookie, Value: "default-must-not-be-forwarded"})
+	req.AddCookie(&http.Cookie{Name: "zitadel.custom-useragent", Value: "encrypted-custom"})
+	req.AddCookie(&http.Cookie{Name: secureSessionCookieName, Value: "session-must-not-be-forwarded"})
+	require.Error(t, srv.proxyToZitadel(rr, req, "header.payload.signature", ""))
+	assert.Equal(t, "zitadel.custom-useragent=encrypted-custom", receivedCookieHeader)
+}
+
 func TestZitadelRelayReturnsSameOriginRegistrationForm(t *testing.T) {
 	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/ui/login/login/jwt/authorize")
 	cfg.PublicURL = "https://zitadel.test/tg"
@@ -638,6 +728,7 @@ func TestZitadelRelayReturnsSameOriginRegistrationForm(t *testing.T) {
 	}
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "https://zitadel.test/tg/auth/telegram/123", nil)
+	addZitadelUserAgentCookie(req)
 	err := srv.proxyToZitadel(rr, req, "header.payload.signature-secret", "")
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, rr.Code)
@@ -654,6 +745,56 @@ func TestZitadelRelayReturnsSameOriginRegistrationForm(t *testing.T) {
 	assert.NotContains(t, logs.String(), "sensitive-csrf")
 	assert.NotContains(t, logs.String(), "sensitive-request")
 	assert.NotContains(t, logs.String(), "signature-secret")
+}
+
+func TestZitadelRelayRejectsRegistrationWithoutOriginalUserAgentCookie(t *testing.T) {
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/ui/login/login/jwt/authorize")
+	cfg.PublicURL = "https://zitadel.test/tg"
+	srv := &Server{
+		cfg: cfg,
+		proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type": []string{"text/html"},
+					"Set-Cookie":   []string{"csrf=must-not-be-relayed"},
+				},
+				Body: io.NopCloser(strings.NewReader(testZitadelRegistrationForm)),
+			}, nil
+		}),
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "https://zitadel.test/tg/auth/telegram/123", nil)
+	err := srv.proxyToZitadel(rr, req, "header.payload.signature-secret", "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "user_agent_cookie_missing_or_invalid")
+	assert.Equal(t, http.StatusBadGateway, rr.Code)
+	assert.Empty(t, rr.Header().Values("Set-Cookie"))
+}
+
+func TestZitadelRelayRejectsRegistrationWhenPublicOriginDiffers(t *testing.T) {
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/ui/login/login/jwt/authorize")
+	cfg.PublicURL = "https://alternate.test/tg"
+	srv := &Server{
+		cfg: cfg,
+		proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type": []string{"text/html"},
+					"Set-Cookie":   []string{"csrf=must-not-be-relayed"},
+				},
+				Body: io.NopCloser(strings.NewReader(testZitadelRegistrationForm)),
+			}, nil
+		}),
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "https://zitadel.test/tg/auth/telegram/123", nil)
+	addZitadelUserAgentCookie(req)
+	err := srv.proxyToZitadel(rr, req, "header.payload.signature", "")
+	require.Error(t, err)
+	assert.Equal(t, http.StatusBadGateway, rr.Code)
+	assert.Empty(t, rr.Header().Values("Set-Cookie"))
 }
 
 func TestZitadelRelayRejectsCrossOriginRegistrationForm(t *testing.T) {
@@ -731,6 +872,7 @@ func TestZitadelRelayRejectsInsecureRegistrationRequest(t *testing.T) {
 	}
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "http://zitadel.test/auth/telegram/123", nil)
+	addZitadelUserAgentCookie(req)
 	err := srv.proxyToZitadel(rr, req, "header.payload.signature-secret", "")
 	require.Error(t, err)
 	assert.Equal(t, http.StatusBadGateway, rr.Code)
@@ -760,6 +902,7 @@ func TestZitadelRelayDoesNotLogEntityEncodedRegistration(t *testing.T) {
 	}
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "https://zitadel.test/auth/telegram/123", nil)
+	addZitadelUserAgentCookie(req)
 	require.NoError(t, srv.proxyToZitadel(rr, req, "header.payload.signature-secret", ""))
 	assert.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, logs.String(), "registration_sensitive=true")
@@ -796,6 +939,7 @@ func TestZitadelRegistrationRelayTrustsForwardedHTTPSOnlyFromConfiguredProxy(t *
 			req := httptest.NewRequest(http.MethodPost, "http://zitadel.test/auth/telegram/123", nil)
 			req.RemoteAddr = tt.remoteAddr
 			req.Header.Set("X-Forwarded-Proto", "https")
+			addZitadelUserAgentCookie(req)
 			err := srv.proxyToZitadel(rr, req, "header.payload.signature-secret", "")
 			if tt.wantOK {
 				require.NoError(t, err)
@@ -1425,6 +1569,7 @@ func testConfig(jwksURL string, zitadelEndpoint string) Config {
 		Zitadel: ZitadelConfig{
 			JWTEndpoint:     zitadelEndpoint,
 			JWTHeader:       "x-zitadel-jwt",
+			UserAgentCookie: defaultZitadelUserAgentCookie,
 			RedirectOrigins: []string{"https://app.test"},
 		},
 		JWT: JWTConfig{
