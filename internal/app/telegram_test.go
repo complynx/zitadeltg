@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -11,9 +12,38 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestTelegramValidationErrorCategory(t *testing.T) {
+	tests := []struct {
+		err  error
+		want string
+	}{
+		{err: jwt.ErrTokenMalformed, want: "malformed"},
+		{err: fmt.Errorf("wrapped: %w", jwt.ErrTokenSignatureInvalid), want: "invalid_signature"},
+		{err: jwt.ErrTokenExpired, want: "expired"},
+		{err: jwt.ErrTokenNotValidYet, want: "not_valid_yet"},
+		{err: jwt.ErrTokenInvalidIssuer, want: "invalid_issuer"},
+		{err: jwt.ErrTokenInvalidAudience, want: "invalid_audience"},
+		{err: jwt.ErrTokenRequiredClaimMissing, want: "required_claim_missing"},
+		{err: jwt.ErrTokenUsedBeforeIssued, want: "issued_in_future"},
+		{err: jwt.ErrTokenUnverifiable, want: "unverifiable"},
+		{err: jwt.ErrTokenInvalidClaims, want: "invalid_claims"},
+		{err: errTelegramTokenInvalid, want: "invalid_token"},
+		{err: errTelegramSubjectMissing, want: "subject_missing"},
+		{err: errTelegramIssuedAtMissing, want: "issued_at_missing"},
+		{err: errTelegramNonceMismatch, want: "nonce_mismatch"},
+		{err: context.Canceled, want: "canceled"},
+		{err: context.DeadlineExceeded, want: "timeout"},
+		{err: errors.New("sensitive details"), want: "invalid_token"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, telegramValidationErrorCategory(tt.err))
+	}
+}
 
 func TestTelegramValidatorValidatesSignedIDToken(t *testing.T) {
 	signer := newTestSigner(t, "telegram-key")

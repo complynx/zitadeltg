@@ -26,6 +26,22 @@ func main() {
 		logger.Error("load config failed", slog.String("config", *configPath), slog.Any("error", err))
 		os.Exit(1)
 	}
+	logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	slog.SetDefault(logger)
+	logger.Debug("runtime configuration loaded",
+		slog.String("listen", cfg.Listen),
+		slog.String("issuer", cfg.Issuer),
+		slog.String("zitadel_jwt_endpoint", cfg.Zitadel.JWTEndpoint),
+		slog.String("zitadel_jwt_header", cfg.Zitadel.JWTHeader),
+		slog.String("jwt_audience", cfg.JWT.Audience),
+		slog.String("jwt_key_id", cfg.JWT.KeyID),
+		slog.String("telegram_issuer", cfg.Telegram.Issuer),
+		slog.Bool("synthetic_email_verified", cfg.SyntheticEmailVerified),
+		slog.Bool("secure_cookies", cfg.Proxy.SecureCookies),
+		slog.Int("trusted_proxy_cidr_count", len(cfg.Proxy.TrustedCIDRs)),
+		slog.Int("redirect_origin_count", len(cfg.Zitadel.RedirectOrigins)),
+		slog.Int("bot_count", len(cfg.Bots)),
+	)
 
 	signer, err := app.NewSigner(cfg.JWT)
 	if err != nil {
@@ -35,6 +51,10 @@ func main() {
 	if signer.Ephemeral() {
 		logger.Warn("using ephemeral JWT signing key; configure jwt.private_key_file or jwt.private_key for stable ZITADEL verification")
 	}
+	logger.Debug("JWT signer initialized",
+		slog.String("key_id", cfg.JWT.KeyID),
+		slog.Bool("ephemeral", signer.Ephemeral()),
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -54,7 +74,12 @@ func main() {
 		MaxHeaderBytes:    16 * 1024,
 	}
 
-	logger.Info("zitadeltg listening", slog.String("addr", cfg.Listen), slog.String("issuer", cfg.Issuer), slog.Int("bot_count", len(cfg.Bots)))
+	logger.Info("zitadeltg listening",
+		slog.String("addr", cfg.Listen),
+		slog.String("issuer", cfg.Issuer),
+		slog.Int("bot_count", len(cfg.Bots)),
+		slog.String("log_level", cfg.LogLevel.String()),
+	)
 	serveErr := make(chan error, 1)
 	go func() {
 		serveErr <- httpServer.ListenAndServe()

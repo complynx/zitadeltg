@@ -25,6 +25,7 @@ import (
 const (
 	maxAuthFormBytes          = 64 * 1024
 	maxLoginQueryBytes        = 2048
+	maxZitadelResponseBytes   = 32 * 1024
 	minimumRelayLifetime      = 5 * time.Second
 	minimumConfiguredJWTTTL   = minimumRelayLifetime + time.Second
 	secureSessionCookieName   = "__Host-zitadeltg_session"
@@ -95,6 +96,21 @@ func NewServer(ctx context.Context, cfg Config, signer *Signer, httpClient *http
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.logger != nil && s.logger.Enabled(r.Context(), slog.LevelDebug) {
+		started := time.Now()
+		metrics := &responseMetricsWriter{ResponseWriter: w, status: http.StatusOK}
+		s.serveHTTP(metrics, r)
+		s.logger.DebugContext(r.Context(), "request completed", requestAttrs(r,
+			slog.Int("status", metrics.status),
+			slog.Int("response_bytes", metrics.bytes),
+			slog.Duration("duration", time.Since(started)),
+		)...)
+		return
+	}
+	s.serveHTTP(w, r)
+}
+
+func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	setCommonSecurityHeaders(w.Header())
 	if pathHasSuffix(r.URL.Path, "/healthz") {
 		s.handleHealth(w, r)
@@ -152,7 +168,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request, prefix stri
 		if !s.allowRequest(w, r, s.loginLimits, "login_unknown", "unknown") {
 			return
 		}
-		s.logger.Warn("login requested for unknown bot", requestAttrs(r, slog.String("bot_id", botID))...)
+		s.logger.Warn("login requested for unknown bot", requestAttrs(r)...)
 		s.notFound(w)
 		return
 	}
@@ -250,7 +266,7 @@ func (s *Server) handleTelegramAuth(w http.ResponseWriter, r *http.Request, botI
 		if !s.allowRequest(w, r, s.authLimits, "auth_unknown", "unknown") {
 			return
 		}
-		s.logger.Warn("telegram auth posted for unknown bot", requestAttrs(r, slog.String("bot_id", botID))...)
+		s.logger.Warn("telegram auth posted for unknown bot", requestAttrs(r)...)
 		s.notFound(w)
 		return
 	}
@@ -267,7 +283,7 @@ func (s *Server) handleTelegramAuth(w http.ResponseWriter, r *http.Request, botI
 		s.error(w, http.StatusUnsupportedMediaType, "unsupported content type")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxAuthFormBytes)
+	r.Body = http.MaxBytesReader(maxBytesResponseWriter(w), r.Body, maxAuthFormBytes)
 	if err := r.ParseForm(); err != nil {
 		s.logger.Warn("parse telegram auth form failed", requestAttrs(r, slog.String("bot_id", botID), slog.Any("error", err))...)
 		var maxBytesErr *http.MaxBytesError
@@ -308,18 +324,36 @@ func (s *Server) handleTelegramAuth(w http.ResponseWriter, r *http.Request, botI
 		s.error(w, http.StatusBadRequest, "invalid login state")
 		return
 	}
+	s.debugRequest(r, "telegram auth state accepted", slog.String("bot_id", botID))
 	user, err := s.telegram.Validate(r.Context(), idToken, bot.ID, state.Nonce)
 	if err != nil {
-		s.logger.Warn("telegram token validation failed", requestAttrs(r, slog.String("bot_id", botID))...)
+		s.logger.Warn("telegram token validation failed", requestAttrs(r,
+			slog.String("bot_id", botID),
+			slog.String("category", telegramValidationErrorCategory(err)),
+		)...)
 		s.error(w, http.StatusUnauthorized, "invalid Telegram login")
 		return
 	}
+	s.debugRequest(r, "telegram token validated",
+		slog.String("bot_id", botID),
+		slog.Int64("issued_at", user.IssuedAt),
+		slog.Int64("expires_at", user.ExpiresAt),
+		slog.Bool("username_present", user.PreferredUsername != ""),
+		slog.Bool("phone_present", user.PhoneNumber != ""),
+	)
 	jwt, err := s.issueZitadelJWT(bot, user)
 	if err != nil {
 		s.logger.Error("issue zitadel jwt failed", requestAttrs(r, slog.String("bot_id", botID), slog.Any("error", err))...)
 		s.error(w, http.StatusInternalServerError, "could not issue JWT")
 		return
 	}
+	s.debugRequest(r, "zitadel relay jwt issued",
+		slog.String("bot_id", botID),
+		slog.String("issuer", s.cfg.Issuer),
+		slog.String("audience", s.cfg.JWT.Audience),
+		slog.String("key_id", s.cfg.JWT.KeyID),
+		slog.Bool("email_verified", s.cfg.SyntheticEmailVerified),
+	)
 	if err := s.proxyToZitadel(w, r, jwt, state.Query); err != nil {
 		s.logger.Error("zitadel relay failed", requestAttrs(r, slog.String("bot_id", botID), slog.Any("error", err))...)
 		return
@@ -414,11 +448,38 @@ func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt stri
 		return sanitizedRemoteError("call ZITADEL", target.String(), err)
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32*1024))
 	if !isRedirectStatus(resp.StatusCode) {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxZitadelResponseBytes+1))
+		responseTruncated := len(body) > maxZitadelResponseBytes
+		if responseTruncated {
+			body = body[:maxZitadelResponseBytes]
+		}
+		if s.logger != nil && s.logger.Enabled(r.Context(), slog.LevelDebug) {
+			requestID := resp.Header.Get("X-Request-ID")
+			if !upstreamRequestIDLogRe.MatchString(requestID) {
+				requestID = ""
+			}
+			s.logger.DebugContext(r.Context(), "zitadel relay diagnostics", requestAttrs(r,
+				slog.Int("status", resp.StatusCode),
+				slog.String("content_type", resp.Header.Get("Content-Type")),
+				slog.String("zitadel_request_id", requestID),
+				slog.Bool("response_truncated", responseTruncated),
+				slog.Bool("response_read_failed", readErr != nil),
+				slog.String("response_body", redactJWTSignatures(body, jwt)),
+				slog.String("jwt_unsigned", unsignedJWT(jwt)),
+			)...)
+		}
 		s.error(w, http.StatusBadGateway, "unexpected ZITADEL response")
-		return fmt.Errorf("ZITADEL returned status %d", resp.StatusCode)
+		classification := "response_read_failed"
+		if readErr == nil {
+			classification = classifyZitadelResponse(resp.Header.Get("Content-Type"), body)
+		}
+		if requestID := resp.Header.Get("X-Request-ID"); upstreamRequestIDLogRe.MatchString(requestID) {
+			return fmt.Errorf("ZITADEL returned status %d (%s, request_id=%s)", resp.StatusCode, classification, requestID)
+		}
+		return fmt.Errorf("ZITADEL returned status %d (%s)", resp.StatusCode, classification)
 	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxZitadelResponseBytes+1))
 	rawLocation := resp.Header.Get("Location")
 	if rawLocation == "" {
 		s.error(w, http.StatusBadGateway, "invalid ZITADEL redirect")
@@ -446,6 +507,27 @@ func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt stri
 	return nil
 }
 
+func unsignedJWT(encoded string) string {
+	parts := strings.Split(encoded, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	return parts[0] + "." + parts[1]
+}
+
+func redactJWTSignatures(body []byte, encoded string) string {
+	text := string(body)
+	parts := strings.Split(encoded, ".")
+	if len(parts) == 3 {
+		unsigned := parts[0] + "." + parts[1]
+		text = strings.ReplaceAll(text, encoded, unsigned+".[REDACTED]")
+		if len(parts[2]) >= 16 {
+			text = strings.ReplaceAll(text, parts[2], "[REDACTED_JWT_SIGNATURE]")
+		}
+	}
+	return compactJWTLogRe.ReplaceAllString(text, "[REDACTED_JWT]")
+}
+
 func (s *Server) isAllowedRedirect(target *url.URL, resolved *url.URL) bool {
 	if s.cfg.Zitadel.AllowAnyRedirectOrigin {
 		return true
@@ -470,6 +552,40 @@ func isRedirectStatus(status int) bool {
 	default:
 		return false
 	}
+}
+
+func classifyZitadelResponse(contentType string, body []byte) string {
+	lower := bytes.ToLower(body)
+	switch {
+	case bytes.Contains(lower, []byte("token not found")):
+		return "token_not_found"
+	case bytes.Contains(lower, []byte("malformed jwt")):
+		return "malformed_jwt"
+	case bytes.Contains(lower, []byte("invalid issuer")):
+		return "invalid_issuer"
+	case bytes.Contains(lower, []byte("invalid signature")):
+		return "invalid_signature"
+	case bytes.Contains(lower, []byte("invalid tokens provided")) && bytes.Contains(lower, []byte("expired")):
+		return "expired_token"
+	case bytes.Contains(lower, []byte(`name="external-idp-config-id"`)):
+		return "external_user_action_required"
+	case bytes.Contains(lower, []byte("/ui/login/mail/verification")):
+		return "email_verification_required"
+	case bytes.Contains(lower, []byte("/ui/login/username/change")):
+		return "username_change_required"
+	case bytes.Contains(lower, []byte("lgn-mfa-options")), bytes.Contains(lower, []byte("/ui/login/mfa/verify")):
+		return "mfa_required"
+	case bytes.Contains(lower, []byte("login_success.js")):
+		return "login_success_page"
+	}
+	if zitadelErrorIDRe.Match(body) {
+		return "zitadel_error"
+	}
+	mediaType, _, _ := mime.ParseMediaType(contentType)
+	if strings.EqualFold(mediaType, "text/html") || bytes.Contains(lower, []byte("<html")) {
+		return "html_page"
+	}
+	return "non_redirect_response"
 }
 
 func (s *Server) allowRequest(w http.ResponseWriter, r *http.Request, limiter *requestLimiter, scope string, botID string) bool {
@@ -516,6 +632,35 @@ type loginTemplateData struct {
 	CSPNonce      string
 }
 
+type responseMetricsWriter struct {
+	http.ResponseWriter
+	status      int
+	bytes       int
+	wroteHeader bool
+}
+
+func (w *responseMetricsWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.status = status
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseMetricsWriter) Write(data []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(data)
+	w.bytes += n
+	return n, err
+}
+
+func (w *responseMetricsWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func templateJSON(v any) (template.JS, error) {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -538,14 +683,14 @@ func canonicalizeLoginQuery(rawQuery string) (string, error) {
 	// duplicates, then sign a deterministic encoding rather than RawQuery.
 	values, err := url.ParseQuery(rawQuery)
 	if err != nil {
-		return "", err
+		return "", errors.New("login query encoding is invalid")
 	}
 	for key, value := range values {
 		if key == "" {
 			return "", errors.New("query parameter name is empty")
 		}
 		if len(value) != 1 {
-			return "", fmt.Errorf("query parameter %q must occur exactly once", key)
+			return "", errors.New("login query contains a duplicate parameter")
 		}
 	}
 	return values.Encode(), nil
@@ -554,15 +699,15 @@ func canonicalizeLoginQuery(rawQuery string) (string, error) {
 func mergeZitadelQuery(target *url.URL, rawQuery string) error {
 	values, err := url.ParseQuery(rawQuery)
 	if err != nil {
-		return fmt.Errorf("parse signed ZITADEL query: %w", err)
+		return errors.New("signed ZITADEL query encoding is invalid")
 	}
 	targetQuery := target.Query()
 	for key, value := range values {
 		if key == "" || len(value) != 1 {
-			return fmt.Errorf("signed ZITADEL query parameter %q is invalid", key)
+			return errors.New("signed ZITADEL query is invalid")
 		}
 		if targetQuery.Has(key) {
-			return fmt.Errorf("signed ZITADEL query conflicts with configured parameter %q", key)
+			return errors.New("signed ZITADEL query conflicts with endpoint query")
 		}
 		targetQuery.Set(key, value[0])
 	}
@@ -612,9 +757,12 @@ func joinURLPath(prefix string, parts ...string) string {
 }
 
 var (
-	localPartRe    = regexp.MustCompile(`[^a-z0-9_.+-]+`)
-	dotRunRe       = regexp.MustCompile(`\.+`)
-	requestIDLogRe = regexp.MustCompile(`^[0-9a-fA-F-]{16,64}$`)
+	localPartRe            = regexp.MustCompile(`[^a-z0-9_.+-]+`)
+	dotRunRe               = regexp.MustCompile(`\.+`)
+	requestIDLogRe         = regexp.MustCompile(`^[0-9a-fA-F-]{16,64}$`)
+	upstreamRequestIDLogRe = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
+	zitadelErrorIDRe       = regexp.MustCompile(`\(([A-Z][A-Z0-9]*-[A-Za-z0-9]{3,32})\)`)
+	compactJWTLogRe        = regexp.MustCompile(`[A-Za-z0-9_-]{3,}\.[A-Za-z0-9_-]{3,}\.[A-Za-z0-9_-]{16,}`)
 )
 
 func fakeEmail(botID string, userID string, domain string) string {
@@ -720,7 +868,7 @@ func stateCookieVerifier(state string) string {
 func requestAttrs(r *http.Request, attrs ...slog.Attr) []any {
 	out := []any{
 		slog.String("method", r.Method),
-		slog.String("path", r.URL.Path),
+		slog.String("route", requestRouteForLog(r.URL.Path)),
 	}
 	if requestID := r.Header.Get("X-Request-ID"); requestIDLogRe.MatchString(requestID) {
 		out = append(out, slog.String("request_id", requestID))
@@ -729,6 +877,38 @@ func requestAttrs(r *http.Request, attrs ...slog.Attr) []any {
 		out = append(out, attr)
 	}
 	return out
+}
+
+func requestRouteForLog(requestPath string) string {
+	switch {
+	case pathHasSuffix(requestPath, "/healthz"):
+		return "healthz"
+	case pathHasSuffix(requestPath, "/keys"),
+		pathHasSuffix(requestPath, "/jwks.json"),
+		pathHasSuffix(requestPath, "/.well-known/jwks.json"):
+		return "jwks"
+	}
+	if _, _, ok := matchEndpoint(requestPath, "login"); ok {
+		return "login"
+	}
+	if _, _, ok := matchEndpoint(requestPath, "auth/telegram"); ok {
+		return "telegram_auth"
+	}
+	return "unmatched"
+}
+
+func maxBytesResponseWriter(w http.ResponseWriter) http.ResponseWriter {
+	if metrics, ok := w.(*responseMetricsWriter); ok {
+		return metrics.ResponseWriter
+	}
+	return w
+}
+
+func (s *Server) debugRequest(r *http.Request, message string, attrs ...slog.Attr) {
+	if s.logger == nil || !s.logger.Enabled(r.Context(), slog.LevelDebug) {
+		return
+	}
+	s.logger.DebugContext(r.Context(), message, requestAttrs(r, attrs...)...)
 }
 
 func (s *Server) writeBytes(w http.ResponseWriter, data []byte, label string) {

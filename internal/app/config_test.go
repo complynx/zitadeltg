@@ -1,6 +1,7 @@
 package app
 
 import (
+	"log/slog"
 	"net/netip"
 	"strings"
 	"testing"
@@ -43,6 +44,33 @@ bots:
 	assert.True(t, bot.RequestWrite)
 	assert.False(t, bot.RequestPhone)
 	assert.False(t, cfg.SyntheticEmailVerified)
+	assert.Equal(t, slog.LevelInfo, cfg.LogLevel)
+}
+
+func TestParseConfigAcceptsDebugLogLevel(t *testing.T) {
+	cfg, err := ParseConfig([]byte(`
+log_level: debug
+issuer: "https://idp.example.com"
+zitadel:
+  jwt_endpoint: "https://accounts.example.com/idps/jwt"
+bots:
+  - token: "123456789:secret"
+`))
+	require.NoError(t, err)
+	assert.Equal(t, slog.LevelDebug, cfg.LogLevel)
+}
+
+func TestParseConfigRejectsInvalidLogLevel(t *testing.T) {
+	_, err := ParseConfig([]byte(`
+log_level: verbose
+issuer: "https://idp.example.com"
+zitadel:
+  jwt_endpoint: "https://accounts.example.com/idps/jwt"
+bots:
+  - token: "123456789:secret"
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "log_level")
 }
 
 func TestParseConfigPreservesExactIssuerIdentifiers(t *testing.T) {

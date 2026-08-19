@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/netip"
 	"net/url"
 	"os"
@@ -24,6 +25,7 @@ const (
 
 type Config struct {
 	Listen                 string
+	LogLevel               slog.Level
 	PublicURL              string
 	Issuer                 string
 	EmailDomain            string
@@ -85,6 +87,7 @@ type BotConfig struct {
 
 type rawConfig struct {
 	Listen                 string             `yaml:"listen"`
+	LogLevel               string             `yaml:"log_level"`
 	PublicURL              string             `yaml:"public_url"`
 	Issuer                 string             `yaml:"issuer"`
 	EmailDomain            string             `yaml:"email_domain"`
@@ -195,6 +198,7 @@ func ParseConfig(input []byte) (Config, error) {
 	}
 	raw := rawConfig{
 		Listen:      ":8080",
+		LogLevel:    "info",
 		EmailDomain: "telegram.invalid",
 		StateTTL:    "10m",
 		Zitadel: rawZitadelConfig{
@@ -251,6 +255,7 @@ func decodeSingleYAMLDocument(input []byte, target any, knownFields bool) error 
 func (raw *rawConfig) expandEnv() error {
 	fields := []*string{
 		&raw.Listen,
+		&raw.LogLevel,
 		&raw.PublicURL,
 		&raw.Issuer,
 		&raw.EmailDomain,
@@ -377,6 +382,10 @@ func (raw *rawConfig) applyAliases(presence rawConfigPresence) error {
 }
 
 func finalizeConfig(raw rawConfig) (Config, error) {
+	var logLevel slog.Level
+	if err := logLevel.UnmarshalText([]byte(strings.TrimSpace(raw.LogLevel))); err != nil {
+		return Config{}, fmt.Errorf("log_level: %w", err)
+	}
 	jwtTTL, err := time.ParseDuration(raw.JWT.TTL)
 	if err != nil {
 		return Config{}, fmt.Errorf("jwt.ttl: %w", err)
@@ -424,6 +433,7 @@ func finalizeConfig(raw rawConfig) (Config, error) {
 
 	cfg := Config{
 		Listen:                 strings.TrimSpace(raw.Listen),
+		LogLevel:               logLevel,
 		PublicURL:              strings.TrimSpace(raw.PublicURL),
 		Issuer:                 strings.TrimSpace(raw.Issuer),
 		EmailDomain:            strings.TrimSpace(raw.EmailDomain),

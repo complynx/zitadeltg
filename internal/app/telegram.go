@@ -41,6 +41,13 @@ type telegramClaims struct {
 	jwt.RegisteredClaims
 }
 
+var (
+	errTelegramTokenInvalid    = errors.New("Telegram token is invalid")
+	errTelegramSubjectMissing  = errors.New("Telegram subject is missing")
+	errTelegramIssuedAtMissing = errors.New("Telegram issued-at time is missing")
+	errTelegramNonceMismatch   = errors.New("Telegram nonce does not match")
+)
+
 const (
 	defaultHTTPTimeout          = 10 * time.Second
 	maxRemoteResponseHeaderSize = 64 << 10
@@ -140,10 +147,53 @@ func NewTelegramValidator(ctx context.Context, cfg TelegramConfig, httpClient *h
 	if err != nil {
 		return nil, sanitizedRemoteError("initialize Telegram JWKS", cfg.JWKSURL, err)
 	}
+	logger.DebugContext(ctx, "Telegram JWKS initialized",
+		slog.String("jwks_url", redactURLQuery(cfg.JWKSURL)),
+		slog.Duration("refresh_interval", cfg.JWKSCacheTTL),
+	)
 	return &TelegramValidator{
 		cfg:     cfg,
 		keyfunc: k,
 	}, nil
+}
+
+func telegramValidationErrorCategory(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, jwt.ErrTokenMalformed):
+		return "malformed"
+	case errors.Is(err, jwt.ErrTokenSignatureInvalid):
+		return "invalid_signature"
+	case errors.Is(err, jwt.ErrTokenExpired):
+		return "expired"
+	case errors.Is(err, jwt.ErrTokenNotValidYet):
+		return "not_valid_yet"
+	case errors.Is(err, jwt.ErrTokenInvalidIssuer):
+		return "invalid_issuer"
+	case errors.Is(err, jwt.ErrTokenInvalidAudience):
+		return "invalid_audience"
+	case errors.Is(err, jwt.ErrTokenRequiredClaimMissing):
+		return "required_claim_missing"
+	case errors.Is(err, jwt.ErrTokenUsedBeforeIssued):
+		return "issued_in_future"
+	case errors.Is(err, jwt.ErrTokenUnverifiable):
+		return "unverifiable"
+	case errors.Is(err, jwt.ErrTokenInvalidClaims):
+		return "invalid_claims"
+	case errors.Is(err, errTelegramTokenInvalid):
+		return "invalid_token"
+	case errors.Is(err, errTelegramSubjectMissing):
+		return "subject_missing"
+	case errors.Is(err, errTelegramIssuedAtMissing):
+		return "issued_at_missing"
+	case errors.Is(err, errTelegramNonceMismatch):
+		return "nonce_mismatch"
+	default:
+		return "invalid_token"
+	}
 }
 
 func redactURLQuery(raw string) string {
@@ -197,16 +247,16 @@ func (v *TelegramValidator) Validate(ctx context.Context, token string, botID st
 		return TelegramUser{}, err
 	}
 	if !parsed.Valid {
-		return TelegramUser{}, errors.New("Telegram token is invalid")
+		return TelegramUser{}, errTelegramTokenInvalid
 	}
 	if claims.Subject == "" {
-		return TelegramUser{}, errors.New("Telegram subject is missing")
+		return TelegramUser{}, errTelegramSubjectMissing
 	}
 	if claims.IssuedAt == nil {
-		return TelegramUser{}, errors.New("Telegram issued-at time is missing")
+		return TelegramUser{}, errTelegramIssuedAtMissing
 	}
 	if nonce == "" || claims.Nonce != nonce {
-		return TelegramUser{}, errors.New("Telegram nonce does not match")
+		return TelegramUser{}, errTelegramNonceMismatch
 	}
 
 	return TelegramUser{

@@ -1,4 +1,5 @@
 listen: ":8080"
+log_level: "info"
 public_url: "https://telegram-idp.example.com"
 issuer: "https://telegram-idp.example.com"
 email_domain: "telegram.invalid"

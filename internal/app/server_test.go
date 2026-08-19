@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -72,6 +73,79 @@ func TestReadOnlyEndpointsAdvertiseGetAndHead(t *testing.T) {
 			assert.Empty(t, headRR.Body.String())
 		})
 	}
+}
+
+func TestDebugRequestCompletionLogging(t *testing.T) {
+	var logs bytes.Buffer
+	srv := &Server{logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, logs.String(), "msg=\"request completed\"")
+	assert.Contains(t, logs.String(), "method=GET")
+	assert.Contains(t, logs.String(), "route=healthz")
+	assert.Contains(t, logs.String(), "status=200")
+	assert.Contains(t, logs.String(), "response_bytes=11")
+	assert.Contains(t, logs.String(), "duration=")
+}
+
+func TestDebugRequestCompletionLoggingIsDisabledAtInfo(t *testing.T) {
+	var logs bytes.Buffer
+	srv := &Server{logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))}
+	srv.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	assert.Empty(t, logs.String())
+}
+
+func TestRequestLogsDoNotEchoUntrustedPathsOrUnknownBotIDs(t *testing.T) {
+	const secret = "123456789:bot-secret-marker"
+	var logs bytes.Buffer
+	srv := &Server{
+		logger:        slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		loginLimits:   newRequestLimiter(RateLimitBucketConfig{Requests: 10, Window: time.Minute}),
+		authLimits:    newRequestLimiter(RateLimitBucketConfig{Requests: 10, Window: time.Minute}),
+		rateLimitLogs: newRequestLimiter(RateLimitBucketConfig{Requests: 10, Window: time.Minute}),
+	}
+
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/login/"+secret, nil),
+		httptest.NewRequest(http.MethodPost, "/auth/telegram/"+secret, nil),
+		httptest.NewRequest(http.MethodGet, "/unmatched/header.payload.signature-secret-marker", nil),
+	} {
+		srv.ServeHTTP(httptest.NewRecorder(), request)
+	}
+
+	assert.Contains(t, logs.String(), "route=login")
+	assert.Contains(t, logs.String(), "route=telegram_auth")
+	assert.Contains(t, logs.String(), "route=unmatched")
+	assert.NotContains(t, logs.String(), secret)
+	assert.NotContains(t, logs.String(), "signature-secret-marker")
+
+	const querySecret = "query-secret-marker"
+	srv.botsByID = map[string]BotConfig{"123": {ID: "123"}}
+	srv.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/login/123?"+querySecret+"=1&"+querySecret+"=2", nil))
+	assert.NotContains(t, logs.String(), querySecret)
+}
+
+func TestMaxBytesResponseWriterUnwrapsDebugMetrics(t *testing.T) {
+	base := httptest.NewRecorder()
+	metrics := &responseMetricsWriter{ResponseWriter: base}
+	assert.Same(t, base, maxBytesResponseWriter(metrics))
+	assert.Same(t, base, maxBytesResponseWriter(base))
+}
+
+func TestResponseMetricsWriterTracksFirstStatusAndActualBytes(t *testing.T) {
+	base := httptest.NewRecorder()
+	metrics := &responseMetricsWriter{ResponseWriter: base, status: http.StatusOK}
+	metrics.WriteHeader(http.StatusTeapot)
+	metrics.WriteHeader(http.StatusInternalServerError)
+	n, err := metrics.Write([]byte("abc"))
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
+	assert.Equal(t, http.StatusTeapot, metrics.status)
+	assert.Equal(t, 3, metrics.bytes)
+	assert.Equal(t, http.StatusTeapot, base.Code)
 }
 
 func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
@@ -457,24 +531,163 @@ func TestFakeEmailStaysWithinMailboxLengthLimit(t *testing.T) {
 }
 
 func TestZitadelRelayRejectsNonRedirectBodies(t *testing.T) {
+	const signature = "signature-secret-value"
+	const relayJWT = "header.payload." + signature
 	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/idps/jwt")
+	var logs bytes.Buffer
 	srv := &Server{
 		cfg: cfg,
+		logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		})),
 		proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"text/html"}},
-				Body:       io.NopCloser(strings.NewReader(`<script>window.pwned=true</script>`)),
+				Header: http.Header{
+					"Content-Type": []string{"text/html"},
+					"X-Request-Id": []string{"da30pu67r44s7385t9d0"},
+				},
+				Body: io.NopCloser(strings.NewReader(`<script>window.pwned=true</script>` + relayJWT)),
 			}, nil
 		}),
 	}
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/auth/telegram/123", nil)
-	err := srv.proxyToZitadel(rr, req, "jwt", "requestID=abc")
+	err := srv.proxyToZitadel(rr, req, relayJWT, "requestID=abc")
 	require.Error(t, err)
 	assert.Equal(t, http.StatusBadGateway, rr.Code)
+	assert.Contains(t, err.Error(), "html_page")
+	assert.Contains(t, err.Error(), "request_id=da30pu67r44s7385t9d0")
+	assert.NotContains(t, err.Error(), "window.pwned")
 	assert.NotContains(t, rr.Body.String(), "script")
 	assert.Contains(t, rr.Header().Get("Content-Security-Policy"), "default-src 'none'")
+	assert.Contains(t, logs.String(), "response_body=")
+	assert.Contains(t, logs.String(), "window.pwned=true")
+	assert.Contains(t, logs.String(), "[REDACTED]")
+	assert.Contains(t, logs.String(), "jwt_unsigned=header.payload")
+	assert.NotContains(t, logs.String(), signature)
+}
+
+func TestZitadelRelayDiagnosticsAreDisabledAtInfo(t *testing.T) {
+	var logs bytes.Buffer
+	srv := &Server{
+		cfg:    testConfig("https://telegram.test/jwks", "https://zitadel.test/idps/jwt"),
+		logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html"}},
+				Body:       io.NopCloser(strings.NewReader("sensitive-response")),
+			}, nil
+		}),
+	}
+	err := srv.proxyToZitadel(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/auth/telegram/123", nil), "header.payload.signature-secret", "")
+	require.Error(t, err)
+	assert.Empty(t, logs.String())
+}
+
+func TestZitadelRelayNonRedirectAllowsNilLogger(t *testing.T) {
+	srv := &Server{
+		cfg: testConfig("https://telegram.test/jwks", "https://zitadel.test/idps/jwt"),
+		proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html"}},
+				Body:       io.NopCloser(strings.NewReader("failure")),
+			}, nil
+		}),
+	}
+	assert.NotPanics(t, func() {
+		err := srv.proxyToZitadel(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/auth/telegram/123", nil), "header.payload.signature-secret", "")
+		require.Error(t, err)
+	})
+}
+
+func TestZitadelRelayDiagnosticsReportBodyCompleteness(t *testing.T) {
+	tests := []struct {
+		name           string
+		body           io.ReadCloser
+		wantTruncated  bool
+		wantReadFailed bool
+	}{
+		{name: "exact limit", body: io.NopCloser(strings.NewReader(strings.Repeat("x", maxZitadelResponseBytes)))},
+		{name: "over limit", body: io.NopCloser(strings.NewReader(strings.Repeat("x", maxZitadelResponseBytes+1))), wantTruncated: true},
+		{name: "partial read error", body: &partialErrorReadCloser{}, wantReadFailed: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			srv := &Server{
+				cfg:    testConfig("https://telegram.test/jwks", "https://zitadel.test/idps/jwt"),
+				logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+				proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/plain"}}, Body: tt.body}, nil
+				}),
+			}
+			err := srv.proxyToZitadel(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/auth/telegram/123", nil), "header.payload.signature-secret", "")
+			require.Error(t, err)
+			assert.Contains(t, logs.String(), "response_truncated="+strconv.FormatBool(tt.wantTruncated))
+			assert.Contains(t, logs.String(), "response_read_failed="+strconv.FormatBool(tt.wantReadFailed))
+			if tt.wantReadFailed {
+				assert.Contains(t, err.Error(), "response_read_failed")
+				assert.NotContains(t, err.Error(), "invalid_issuer")
+			}
+		})
+	}
+}
+
+func TestUnsignedJWTExcludesSignature(t *testing.T) {
+	const encoded = "header.payload.signature-secret"
+	assert.Equal(t, "header.payload", unsignedJWT(encoded))
+	assert.NotContains(t, unsignedJWT(encoded), "signature-secret")
+	assert.Empty(t, unsignedJWT("not-a-jwt"))
+}
+
+func TestRedactJWTSignatures(t *testing.T) {
+	const relayJWT = "relayhead.relaypayload.relay-signature-secret"
+	const otherJWT = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.another-signature-secret"
+	const shortPayloadJWT = "eyJhbGciOiJIUzI1NiJ9.e30.abcdefghijklmnop"
+	body := []byte("relay=" + relayJWT + " other=" + otherJWT + " short=" + shortPayloadJWT)
+	got := redactJWTSignatures(body, relayJWT)
+	assert.Contains(t, got, "relayhead.relaypayload.[REDACTED]")
+	assert.Contains(t, got, "[REDACTED_JWT]")
+	assert.NotContains(t, got, "relay-signature-secret")
+	assert.NotContains(t, got, "another-signature-secret")
+	assert.NotContains(t, got, "abcdefghijklmnop")
+}
+
+func TestRedactJWTSignaturesRedactsExactRelayWithShortSegments(t *testing.T) {
+	const relayJWT = "a.b.c"
+	got := redactJWTSignatures([]byte("relay="+relayJWT), relayJWT)
+	assert.Equal(t, "relay=a.b.[REDACTED]", got)
+	assert.NotContains(t, got, ".c")
+}
+
+func TestClassifyZitadelResponseReturnsOnlySafeCategories(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		want        string
+	}{
+		{name: "token missing", contentType: "text/html; charset=utf-8", body: `<p class="lgn-error-message">Token not found (LOGIN-adh42)</p>`, want: "token_not_found"},
+		{name: "invalid issuer", contentType: "text/html", body: `<p>invalid tokens provided: invalid issuer: secret-value</p>`, want: "invalid_issuer"},
+		{name: "invalid signature", contentType: "text/html", body: `<p>invalid tokens provided: invalid signature: secret-value</p>`, want: "invalid_signature"},
+		{name: "email verification", contentType: "text/html", body: `<form action="/ui/login/mail/verification">`, want: "email_verification_required"},
+		{name: "external user action", contentType: "text/html", body: `<input name="external-idp-config-id" value="sensitive-user-value">`, want: "external_user_action_required"},
+		{name: "stable error id", contentType: "text/html", body: `<p>translated message (APP-9sdp4)</p>`, want: "zitadel_error"},
+		{name: "error shaped secret", contentType: "text/html", body: `<p>(SECRET-secretvalue)</p>`, want: "zitadel_error"},
+		{name: "unknown html", contentType: "text/html; charset=utf-8", body: `<p>sensitive-user-value</p>`, want: "html_page"},
+		{name: "unknown response", contentType: "application/json", body: `sensitive-user-value`, want: "non_redirect_response"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyZitadelResponse(tt.contentType, []byte(tt.body))
+			assert.Equal(t, tt.want, got)
+			assert.NotContains(t, got, "sensitive")
+			assert.NotContains(t, got, "secret")
+		})
+	}
 }
 
 func TestZitadelRelayRejectsNonHTTPSRedirect(t *testing.T) {
@@ -762,6 +975,20 @@ type trackingReadCloser struct {
 	read   bool
 	closed bool
 }
+
+type partialErrorReadCloser struct {
+	sent bool
+}
+
+func (r *partialErrorReadCloser) Read(data []byte) (int, error) {
+	if r.sent {
+		return 0, errors.New("test read failure")
+	}
+	r.sent = true
+	return copy(data, "invalid issuer in partial response"), nil
+}
+
+func (*partialErrorReadCloser) Close() error { return nil }
 
 func (r *trackingReadCloser) Read(p []byte) (int, error) {
 	r.read = true

@@ -198,9 +198,25 @@ tokens are not accepted from query strings. Startup fails if Telegram's JWKS
 cannot be fetched, so deployment issues do not silently turn into login-time
 verification failures.
 
-Logs are emitted with Go `slog` in text format and include validation failures,
-JWKS refresh failures, and ZITADEL relay errors without logging Telegram user
-IDs, IP addresses, ID tokens, or bot secrets.
+Logs are emitted with Go `slog` in text format. `log_level` accepts Go slog
+levels such as `debug`, `info`, `warn`, and `error`, and defaults to `info`.
+At normal levels, validation failures include finite failure categories, while
+JWKS refresh failures and ZITADEL relay errors remain sanitized. These records
+do not include Telegram user IDs, IP addresses, ID tokens, or bot secrets.
+
+At `debug`, the service also records request completion status, response size
+and duration; safe authentication-stage milestones; JWKS initialization; and
+ZITADEL relay metadata. Logs use finite route labels instead of raw request
+paths. Request paths and query strings, client IP addresses, Telegram ID
+tokens, bot tokens, state values, and session cookies are not logged.
+
+For a failed ZITADEL relay, `log_level: debug` additionally logs the ZITADEL
+response body (bounded to 32 KiB) and the generated relay JWT as
+`jwt_unsigned=header.payload`. The dedicated field omits the signature, and
+compact JWTs reflected in the upstream body are redacted on a best-effort
+basis, but unsigned claims and the remaining response can contain identity or
+session data. Enable debug only for a short reproduction, restrict access to
+the logs, then restore `info` and delete the diagnostic log.
 
 The login page loads Telegram's official Login library from
 `oauth.telegram.org`; that script is therefore part of the authentication trust
