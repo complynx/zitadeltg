@@ -595,6 +595,22 @@ func TestIssueZitadelJWTRejectsInsufficientRelayLifetime(t *testing.T) {
 	assert.Contains(t, err.Error(), "expires too soon")
 }
 
+func TestIssueZitadelJWTUsesConfiguredSyntheticEmailVerification(t *testing.T) {
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/idps/jwt")
+	cfg.SyntheticEmailVerified = true
+	signer := newTestSigner(t, "idp-key")
+	srv := &Server{cfg: cfg, signer: signer}
+	token, err := srv.issueZitadelJWT(cfg.Bots[0], TelegramUser{Subject: "subject", IssuedAt: time.Now().Unix()})
+	require.NoError(t, err)
+
+	claims := jwt.MapClaims{}
+	_, err = jwt.ParseWithClaims(token, claims, func(token *jwt.Token) (any, error) {
+		return &signer.private.PublicKey, nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}))
+	require.NoError(t, err)
+	assert.Equal(t, true, claims["email_verified"])
+}
+
 func TestIssueZitadelJWTSerializedExpiryMeetsMinimumLifetime(t *testing.T) {
 	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/idps/jwt")
 	cfg.JWT.TTL = minimumConfiguredJWTTTL

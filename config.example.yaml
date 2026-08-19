@@ -2,10 +2,14 @@ listen: ":8080"
 public_url: "https://telegram-idp.example.com"
 issuer: "https://telegram-idp.example.com"
 email_domain: "telegram.invalid"
+# ZITADEL Login V1 requires a verified email before completing authentication.
+# Enable only with the reserved .invalid domain and keep email auto-linking disabled.
+synthetic_email_verified: false
 state_ttl: "10m"
 
 zitadel:
-  jwt_endpoint: "https://accounts.example.com/idps/jwt"
+  # ZITADEL v4.15.0 Login V1 callback.
+  jwt_endpoint: "https://accounts.example.com/ui/login/login/jwt/authorize"
   jwt_header: "x-telegram-idp-jwt"
   # Same-origin redirects are always accepted. List every additional application origin.
   redirect_origins:
@@ -19,8 +23,7 @@ jwt:
   # If the file does not exist, zitadeltg creates a 2048-bit RSA key with 0600 permissions.
   private_key_file: "./zitadeltg-rsa.pem"
   # private_key: "${ZITADELTG_PRIVATE_KEY_PEM}"
-  # Configure the same audience on the ZITADEL JWT IdP. Defaults to jwt_endpoint.
-  audience: "https://accounts.example.com/idps/jwt"
+  # Configure the same audience on the ZITADEL JWT IdP. Omitted here so it defaults to jwt_endpoint.
 
 telegram:
   issuer: "https://oauth.telegram.org"

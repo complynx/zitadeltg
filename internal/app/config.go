@@ -23,17 +23,18 @@ const (
 )
 
 type Config struct {
-	Listen      string
-	PublicURL   string
-	Issuer      string
-	EmailDomain string
-	StateTTL    time.Duration
-	Zitadel     ZitadelConfig
-	JWT         JWTConfig
-	Telegram    TelegramConfig
-	Proxy       ProxyConfig
-	RateLimit   RateLimitConfig
-	Bots        []BotConfig
+	Listen                 string
+	PublicURL              string
+	Issuer                 string
+	EmailDomain            string
+	SyntheticEmailVerified bool
+	StateTTL               time.Duration
+	Zitadel                ZitadelConfig
+	JWT                    JWTConfig
+	Telegram               TelegramConfig
+	Proxy                  ProxyConfig
+	RateLimit              RateLimitConfig
+	Bots                   []BotConfig
 }
 
 type ZitadelConfig struct {
@@ -83,18 +84,19 @@ type BotConfig struct {
 }
 
 type rawConfig struct {
-	Listen      string             `yaml:"listen"`
-	PublicURL   string             `yaml:"public_url"`
-	Issuer      string             `yaml:"issuer"`
-	EmailDomain string             `yaml:"email_domain"`
-	StateTTL    string             `yaml:"state_ttl"`
-	Zitadel     rawZitadelConfig   `yaml:"zitadel"`
-	JWT         rawJWTConfig       `yaml:"jwt"`
-	Telegram    rawTelegramConfig  `yaml:"telegram"`
-	Proxy       rawProxyConfig     `yaml:"proxy"`
-	RateLimit   rawRateLimitConfig `yaml:"rate_limit"`
-	Bots        []rawBotConfig     `yaml:"bots"`
-	Aliases     rawTopLevelAliases `yaml:",inline"`
+	Listen                 string             `yaml:"listen"`
+	PublicURL              string             `yaml:"public_url"`
+	Issuer                 string             `yaml:"issuer"`
+	EmailDomain            string             `yaml:"email_domain"`
+	SyntheticEmailVerified bool               `yaml:"synthetic_email_verified"`
+	StateTTL               string             `yaml:"state_ttl"`
+	Zitadel                rawZitadelConfig   `yaml:"zitadel"`
+	JWT                    rawJWTConfig       `yaml:"jwt"`
+	Telegram               rawTelegramConfig  `yaml:"telegram"`
+	Proxy                  rawProxyConfig     `yaml:"proxy"`
+	RateLimit              rawRateLimitConfig `yaml:"rate_limit"`
+	Bots                   []rawBotConfig     `yaml:"bots"`
+	Aliases                rawTopLevelAliases `yaml:",inline"`
 }
 
 type rawTopLevelAliases struct {
@@ -421,11 +423,12 @@ func finalizeConfig(raw rawConfig) (Config, error) {
 	}
 
 	cfg := Config{
-		Listen:      strings.TrimSpace(raw.Listen),
-		PublicURL:   strings.TrimSpace(raw.PublicURL),
-		Issuer:      strings.TrimSpace(raw.Issuer),
-		EmailDomain: strings.TrimSpace(raw.EmailDomain),
-		StateTTL:    stateTTL,
+		Listen:                 strings.TrimSpace(raw.Listen),
+		PublicURL:              strings.TrimSpace(raw.PublicURL),
+		Issuer:                 strings.TrimSpace(raw.Issuer),
+		EmailDomain:            strings.TrimSpace(raw.EmailDomain),
+		SyntheticEmailVerified: raw.SyntheticEmailVerified,
+		StateTTL:               stateTTL,
 		Zitadel: ZitadelConfig{
 			JWTEndpoint:            strings.TrimSpace(raw.Zitadel.JWTEndpoint),
 			JWTHeader:              strings.TrimSpace(raw.Zitadel.JWTHeader),
@@ -465,6 +468,9 @@ func finalizeConfig(raw rawConfig) (Config, error) {
 	}
 	if cfg.EmailDomain == "" {
 		return Config{}, errors.New("email_domain is required")
+	}
+	if cfg.SyntheticEmailVerified && !isReservedInvalidDomain(cfg.EmailDomain) {
+		return Config{}, errors.New("synthetic_email_verified requires email_domain to be a subdomain of the reserved invalid domain")
 	}
 	if cfg.Zitadel.JWTEndpoint == "" {
 		return Config{}, errors.New("zitadel.jwt_endpoint is required")
@@ -627,6 +633,11 @@ func canonicalHTTPSOrigin(parsed *url.URL) string {
 		host += ":" + port
 	}
 	return "https://" + host
+}
+
+func isReservedInvalidDomain(domain string) bool {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	return strings.HasSuffix(domain, ".invalid")
 }
 
 const maxSyntheticEmailDomainBytes = 254 - 1 - 64

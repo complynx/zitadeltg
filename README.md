@@ -53,6 +53,13 @@ audience; when `jwt.audience` is omitted it defaults to
 `public_url` is the canonical external identity used as the default `issuer`;
 it does not constrain request `Host` headers or route matching.
 
+`synthetic_email_verified` defaults to `false`. ZITADEL Login V1 requires a
+verified email before it completes authentication, so deployments using
+automatic external-user creation can set it to `true`. This opt-in is accepted
+only when `email_domain` is a subdomain of the reserved `invalid` domain, such
+as `telegram.invalid`. Keep email-based automatic linking disabled: these
+addresses are stable synthetic identifiers, not deliverable mailboxes.
+
 If `jwt.private_key_file` is omitted, it defaults to `/data/zitadeltg-rsa.pem`. When
 the configured key file does not exist, the service creates a 2048-bit RSA key
 with `0600` permissions, publishes it atomically without replacing an existing
@@ -135,8 +142,9 @@ collision-resistant digest of the original bot/subject pair:
 tg+BOT_ID+SANITIZED_SUBJECT+DIGEST@email_domain
 ```
 
-Synthetic addresses are sent with `email_verified=false`; configure ZITADEL to
-identify users by `sub`, not by matching these addresses to existing accounts.
+Synthetic addresses are sent with the configured `synthetic_email_verified`
+value; configure ZITADEL to identify users by `sub`, not by matching these
+addresses to existing accounts.
 The digest prevents different subjects that sanitize to the same text from
 sharing an address. The service does not use Telegram's optional custom `id`
 claim for identity.
@@ -152,10 +160,14 @@ Create a JWT IdP in ZITADEL with:
 - Audience: the configured `jwt.audience` (by default the value of
   `zitadel.jwt_endpoint`).
 
+If `synthetic_email_verified` is enabled, disable email-based automatic linking
+on the ZITADEL identity provider. Resolve users by the external issuer and
+`sub`; the asserted email is synthetic and proves no mailbox ownership.
+
 Set `zitadel.jwt_endpoint` in this service to the ZITADEL login callback:
 
 - Login V2: `https://accounts.example.com/idps/jwt`
-- Login V1: `https://accounts.example.com/ui/login/idps/jwt`
+- ZITADEL v4.15.0 Login V1: `https://accounts.example.com/ui/login/login/jwt/authorize`
 
 ## Telegram Setup
 

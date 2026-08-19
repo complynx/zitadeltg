@@ -42,6 +42,7 @@ bots:
 	assert.Equal(t, "Main_Bot", bot.Name)
 	assert.True(t, bot.RequestWrite)
 	assert.False(t, bot.RequestPhone)
+	assert.False(t, cfg.SyntheticEmailVerified)
 }
 
 func TestParseConfigPreservesExactIssuerIdentifiers(t *testing.T) {
@@ -57,6 +58,48 @@ bots:
 	require.NoError(t, err)
 	assert.Equal(t, "https://idp.example.com/tenant/", cfg.Issuer)
 	assert.Equal(t, "https://telegram.example.com/oidc/", cfg.Telegram.Issuer)
+}
+
+func TestParseConfigAllowsVerifiedSyntheticEmailOnlyForInvalidSubdomains(t *testing.T) {
+	base := func(domain, enabled string) string {
+		return `
+issuer: "https://idp.example.com"
+email_domain: "` + domain + `"
+synthetic_email_verified: ` + enabled + `
+zitadel:
+  jwt_endpoint: "https://accounts.example.com/idps/jwt"
+bots:
+  - token: "123456789:secret"
+`
+	}
+
+	tests := []struct {
+		name    string
+		domain  string
+		enabled string
+		wantOK  bool
+	}{
+		{name: "reserved subdomain", domain: "login.invalid", enabled: "true", wantOK: true},
+		{name: "case insensitive", domain: "LOGIN.INVALID", enabled: "true", wantOK: true},
+		{name: "bare reserved label is not an email domain", domain: "invalid", enabled: "true"},
+		{name: "public domain", domain: "example.com", enabled: "true"},
+		{name: "suffix without label boundary", domain: "foo.evilinvalid", enabled: "true"},
+		{name: "empty leading label", domain: ".invalid", enabled: "true"},
+		{name: "empty middle label", domain: "foo..invalid", enabled: "true"},
+		{name: "overlong label", domain: strings.Repeat("a", 64) + ".invalid", enabled: "true"},
+		{name: "disabled remains backward compatible", domain: "example.com", enabled: "false", wantOK: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := ParseConfig([]byte(base(tt.domain, tt.enabled)))
+			if tt.wantOK {
+				require.NoError(t, err)
+				assert.Equal(t, tt.enabled == "true", cfg.SyntheticEmailVerified)
+				return
+			}
+			require.Error(t, err)
+		})
+	}
 }
 
 func TestParseConfigRejectsEmptyListen(t *testing.T) {

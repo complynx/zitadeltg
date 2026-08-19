@@ -371,7 +371,7 @@ func (s *Server) issueZitadelJWT(bot BotConfig, user TelegramUser) (string, erro
 		"name":                            name,
 		"preferred_username":              username,
 		"email":                           fakeEmail(bot.ID, userID, s.cfg.EmailDomain),
-		"email_verified":                  false,
+		"email_verified":                  s.cfg.SyntheticEmailVerified,
 		"urn:zitadeltg:telegram:bot_id":   bot.ID,
 		"urn:zitadeltg:telegram:bot_name": bot.Name,
 		"urn:zitadeltg:telegram:subject":  userID,
