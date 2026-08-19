@@ -20,16 +20,22 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 const (
-	maxAuthFormBytes          = 64 * 1024
-	maxLoginQueryBytes        = 2048
-	maxZitadelResponseBytes   = 32 * 1024
-	minimumRelayLifetime      = 5 * time.Second
-	minimumConfiguredJWTTTL   = minimumRelayLifetime + time.Second
-	secureSessionCookieName   = "__Host-zitadeltg_session"
-	insecureSessionCookieName = "zitadeltg_session"
+	maxAuthFormBytes            = 64 * 1024
+	maxLoginQueryBytes          = 2048
+	maxZitadelDiagnosticBytes   = 32 * 1024
+	maxZitadelRegistrationBytes = 256 * 1024
+	zitadelExternalUserFormPath = "/ui/login/externaluser/option"
+	minimumRelayLifetime        = 5 * time.Second
+	minimumConfiguredJWTTTL     = minimumRelayLifetime + time.Second
+	secureSessionCookieName     = "__Host-zitadeltg_session"
+	insecureSessionCookieName   = "zitadeltg_session"
+	registrationSecurityPolicy  = "base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'"
+	registrationFallbackPolicy  = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:"
 )
 
 type Server struct {
@@ -338,6 +344,8 @@ func (s *Server) handleTelegramAuth(w http.ResponseWriter, r *http.Request, botI
 		slog.String("bot_id", botID),
 		slog.Int64("issued_at", user.IssuedAt),
 		slog.Int64("expires_at", user.ExpiresAt),
+		slog.Bool("given_name_present", user.GivenName != ""),
+		slog.Bool("family_name_present", user.FamilyName != ""),
 		slog.Bool("username_present", user.PreferredUsername != ""),
 		slog.Bool("phone_present", user.PhoneNumber != ""),
 	)
@@ -375,13 +383,8 @@ func (s *Server) issueZitadelJWT(bot BotConfig, user TelegramUser) (string, erro
 		return "", errors.New("Telegram token expires too soon")
 	}
 	userID := user.Subject
-	name := user.Name
-	if name == "" {
-		name = user.PreferredUsername
-	}
-	if name == "" {
-		name = "Telegram user " + userID
-	}
+	givenName, familyName := zitadelProfileNames(user)
+	name := zitadelDisplayName(user, userID)
 	username := user.PreferredUsername
 	if username == "" {
 		username = "tg_" + sanitizeLocalPart(userID)
@@ -403,6 +406,8 @@ func (s *Server) issueZitadelJWT(bot BotConfig, user TelegramUser) (string, erro
 		"auth_time":                       authTime,
 		"jti":                             jti,
 		"name":                            name,
+		"given_name":                      givenName,
+		"family_name":                     familyName,
 		"preferred_username":              username,
 		"email":                           fakeEmail(bot.ID, userID, s.cfg.EmailDomain),
 		"email_verified":                  s.cfg.SyntheticEmailVerified,
@@ -421,6 +426,39 @@ func (s *Server) issueZitadelJWT(bot BotConfig, user TelegramUser) (string, erro
 		claims["phone_number_verified"] = user.PhoneNumberVerified
 	}
 	return s.signer.Sign(claims)
+}
+
+func zitadelDisplayName(user TelegramUser, userID string) string {
+	name := strings.TrimSpace(user.Name)
+	if name == "" {
+		name = strings.TrimSpace(user.PreferredUsername)
+	}
+	if name == "" {
+		name = "Telegram user " + userID
+	}
+	return name
+}
+
+func zitadelProfileNames(user TelegramUser) (givenName string, familyName string) {
+	givenName = strings.TrimSpace(user.GivenName)
+	familyName = strings.TrimSpace(user.FamilyName)
+	nameParts := strings.Fields(user.Name)
+	if givenName == "" && len(nameParts) > 0 {
+		givenName = nameParts[0]
+	}
+	if familyName == "" && len(nameParts) > 1 {
+		familyName = strings.Join(nameParts[1:], " ")
+	}
+	if givenName == "" {
+		givenName = strings.TrimSpace(user.PreferredUsername)
+	}
+	if givenName == "" {
+		givenName = "Telegram"
+	}
+	if familyName == "" {
+		familyName = givenName
+	}
+	return givenName, familyName
 }
 
 func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt string, rawQuery string) error {
@@ -449,37 +487,59 @@ func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt stri
 	}
 	defer resp.Body.Close()
 	if !isRedirectStatus(resp.StatusCode) {
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxZitadelResponseBytes+1))
-		responseTruncated := len(body) > maxZitadelResponseBytes
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxZitadelRegistrationBytes+1))
+		responseTruncated := len(body) > maxZitadelRegistrationBytes
 		if responseTruncated {
-			body = body[:maxZitadelResponseBytes]
+			body = body[:maxZitadelRegistrationBytes]
 		}
+		diagnosticBody := body
+		diagnosticTruncated := len(diagnosticBody) > maxZitadelDiagnosticBytes
+		if diagnosticTruncated {
+			diagnosticBody = diagnosticBody[:maxZitadelDiagnosticBytes]
+		}
+		classification := "response_read_failed"
+		if readErr == nil {
+			classification = classifyZitadelResponse(resp.Header.Get("Content-Type"), diagnosticBody)
+		}
+		registrationShape := isZitadelRegistrationForm(body, resp.Header.Get("Content-Type"), resp.StatusCode)
+		recognizedRegistration := readErr == nil && !responseTruncated && registrationShape
+		sensitiveRegistration := registrationShape || isPotentialZitadelRegistration(body)
+		relayRegistration := readErr == nil && !responseTruncated &&
+			recognizedRegistration && s.registrationOriginAllowed(r, target)
 		if s.logger != nil && s.logger.Enabled(r.Context(), slog.LevelDebug) {
 			requestID := resp.Header.Get("X-Request-ID")
 			if !upstreamRequestIDLogRe.MatchString(requestID) {
 				requestID = ""
 			}
-			s.logger.DebugContext(r.Context(), "zitadel relay diagnostics", requestAttrs(r,
+			attrs := []slog.Attr{
 				slog.Int("status", resp.StatusCode),
 				slog.String("content_type", resp.Header.Get("Content-Type")),
 				slog.String("zitadel_request_id", requestID),
 				slog.Bool("response_truncated", responseTruncated),
+				slog.Bool("diagnostic_truncated", diagnosticTruncated),
 				slog.Bool("response_read_failed", readErr != nil),
-				slog.String("response_body", redactJWTSignatures(body, jwt)),
-				slog.String("jwt_unsigned", unsignedJWT(jwt)),
-			)...)
+				slog.String("classification", classification),
+				slog.Bool("registration_sensitive", sensitiveRegistration),
+				slog.Bool("registration_relayed", relayRegistration),
+			}
+			if !sensitiveRegistration {
+				attrs = append(attrs,
+					slog.String("response_body", redactJWTSignatures(diagnosticBody, jwt)),
+					slog.String("jwt_unsigned", unsignedJWT(jwt)),
+				)
+			}
+			s.logger.DebugContext(r.Context(), "zitadel relay diagnostics", requestAttrs(r, attrs...)...)
+		}
+		if relayRegistration {
+			return s.relayZitadelRegistration(w, resp, body)
 		}
 		s.error(w, http.StatusBadGateway, "unexpected ZITADEL response")
-		classification := "response_read_failed"
-		if readErr == nil {
-			classification = classifyZitadelResponse(resp.Header.Get("Content-Type"), body)
-		}
 		if requestID := resp.Header.Get("X-Request-ID"); upstreamRequestIDLogRe.MatchString(requestID) {
 			return fmt.Errorf("ZITADEL returned status %d (%s, request_id=%s)", resp.StatusCode, classification, requestID)
 		}
 		return fmt.Errorf("ZITADEL returned status %d (%s)", resp.StatusCode, classification)
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxZitadelResponseBytes+1))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxZitadelDiagnosticBytes+1))
 	rawLocation := resp.Header.Get("Location")
 	if rawLocation == "" {
 		s.error(w, http.StatusBadGateway, "invalid ZITADEL redirect")
@@ -505,6 +565,259 @@ func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt stri
 	// GET so an upstream 307/308 can never resend that body to the destination.
 	w.WriteHeader(http.StatusSeeOther)
 	return nil
+}
+
+func (s *Server) registrationOriginAllowed(r *http.Request, target *url.URL) bool {
+	if !isSecureRequest(r, s.cfg.Proxy.TrustedCIDRs) {
+		return false
+	}
+	publicURL := s.cfg.PublicURL
+	if publicURL == "" {
+		publicURL = s.cfg.Issuer
+	}
+	public, err := url.Parse(publicURL)
+	requestOrigin, requestErr := url.Parse("https://" + r.Host)
+	if err != nil || requestErr != nil || requestOrigin.Host == "" || requestOrigin.User != nil || requestOrigin.Path != "" {
+		return false
+	}
+	publicOrigin := canonicalHTTPSOrigin(public)
+	return publicOrigin == canonicalHTTPSOrigin(target) && publicOrigin == canonicalHTTPSOrigin(requestOrigin)
+}
+
+func isPotentialZitadelRegistration(body []byte) bool {
+	lower := bytes.ToLower(body)
+	if bytes.Contains(lower, []byte(zitadelExternalUserFormPath)) ||
+		bytes.Contains(lower, []byte("gorilla.csrf.token")) ||
+		bytes.Contains(lower, []byte("authrequestid")) ||
+		bytes.Contains(lower, []byte("external-idp-config-id")) {
+		return true
+	}
+	document, err := html.Parse(bytes.NewReader(body))
+	return err == nil && hasPotentialZitadelRegistrationNode(document)
+}
+
+func hasPotentialZitadelRegistrationNode(node *html.Node) bool {
+	if node.Type == html.ElementNode {
+		if node.Data == "form" {
+			action, err := url.Parse(strings.TrimSpace(htmlAttribute(node, "action")))
+			if err == nil && action.Path == zitadelExternalUserFormPath {
+				return true
+			}
+		}
+		if node.Data == "input" {
+			switch strings.ToLower(htmlAttribute(node, "name")) {
+			case "gorilla.csrf.token", "authrequestid", "external-idp-config-id":
+				return true
+			}
+		}
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if hasPotentialZitadelRegistrationNode(child) {
+			return true
+		}
+	}
+	return false
+}
+
+func isZitadelRegistrationForm(body []byte, contentType string, status int) bool {
+	if status != http.StatusOK {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil || !strings.EqualFold(mediaType, "text/html") {
+		return false
+	}
+	document, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	if hasHTMLElement(document, "base") {
+		return false
+	}
+	if hasUnsafeZitadelRegistrationOverride(document) {
+		return false
+	}
+	return hasZitadelRegistrationForm(document)
+}
+
+func hasHTMLElement(node *html.Node, name string) bool {
+	if node.Type == html.ElementNode && strings.EqualFold(node.Data, name) {
+		return true
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if hasHTMLElement(child, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasUnsafeZitadelRegistrationOverride(node *html.Node) bool {
+	if node.Type == html.ElementNode {
+		if hasHTMLAttribute(node, "form") {
+			return true
+		}
+		if hasHTMLAttribute(node, "formmethod") &&
+			!strings.EqualFold(strings.TrimSpace(htmlAttribute(node, "formmethod")), http.MethodPost) {
+			return true
+		}
+		if hasHTMLAttribute(node, "formaction") &&
+			!isZitadelRegistrationAction(htmlAttribute(node, "formaction")) {
+			return true
+		}
+		if node.Data == "fieldset" && hasHTMLAttribute(node, "disabled") {
+			return true
+		}
+		if node.Data == "input" && hasHTMLAttribute(node, "hidden") {
+			switch htmlAttribute(node, "name") {
+			case "firstname", "lastname":
+				return true
+			}
+		}
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if hasUnsafeZitadelRegistrationOverride(child) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasZitadelRegistrationForm(node *html.Node) bool {
+	formCount := 0
+	registrationFormCount := 0
+	var visit func(*html.Node)
+	visit = func(current *html.Node) {
+		if current.Type == html.ElementNode && current.Data == "form" {
+			formCount++
+			if isZitadelRegistrationFormNode(current) {
+				registrationFormCount++
+			}
+		}
+		for child := current.FirstChild; child != nil; child = child.NextSibling {
+			visit(child)
+		}
+	}
+	visit(node)
+	return formCount == 1 && registrationFormCount == 1
+}
+
+func isZitadelRegistrationFormNode(form *html.Node) bool {
+	if !strings.EqualFold(strings.TrimSpace(htmlAttribute(form, "method")), http.MethodPost) ||
+		!isZitadelRegistrationAction(htmlAttribute(form, "action")) {
+		return false
+	}
+	type fieldRequirement struct {
+		inputType string
+		editable  bool
+	}
+	requiredInputs := map[string]fieldRequirement{
+		"gorilla.csrf.Token":     {inputType: "hidden"},
+		"authRequestID":          {inputType: "hidden"},
+		"external-idp-config-id": {inputType: "hidden"},
+		"firstname":              {inputType: "text", editable: true},
+		"lastname":               {inputType: "text", editable: true},
+	}
+	seenInputs := make(map[string]int, len(requiredInputs))
+	valid := true
+	var visit func(*html.Node)
+	visit = func(node *html.Node) {
+		if !valid {
+			return
+		}
+		if node.Type == html.ElementNode && node.Data == "input" {
+			name := htmlAttribute(node, "name")
+			if requirement, required := requiredInputs[name]; required {
+				seenInputs[name]++
+				if seenInputs[name] != 1 ||
+					!strings.EqualFold(strings.TrimSpace(htmlAttribute(node, "type")), requirement.inputType) ||
+					strings.TrimSpace(htmlAttribute(node, "value")) == "" ||
+					hasHTMLAttribute(node, "disabled") ||
+					(requirement.editable && (hasHTMLAttribute(node, "readonly") ||
+						!hasHTMLAttribute(node, "required"))) {
+					valid = false
+				}
+			}
+		}
+		if node.Type == html.ElementNode && hasHTMLAttribute(node, "formaction") &&
+			!isZitadelRegistrationAction(htmlAttribute(node, "formaction")) {
+			valid = false
+			return
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			visit(child)
+		}
+	}
+	visit(form)
+	if !valid {
+		return false
+	}
+	for name := range requiredInputs {
+		if seenInputs[name] != 1 {
+			return false
+		}
+	}
+	return true
+}
+
+func isZitadelRegistrationAction(action string) bool {
+	actionURL, err := url.Parse(strings.TrimSpace(action))
+	if err != nil || actionURL.IsAbs() || actionURL.Host != "" ||
+		actionURL.Path != zitadelExternalUserFormPath || actionURL.Fragment != "" {
+		return false
+	}
+	switch actionURL.RawQuery {
+	case "none=true", "linkbutton=true", "autoregisterbutton=true":
+		return true
+	default:
+		return false
+	}
+}
+
+func htmlAttribute(node *html.Node, name string) string {
+	for _, attribute := range node.Attr {
+		if strings.EqualFold(attribute.Key, name) {
+			return attribute.Val
+		}
+	}
+	return ""
+}
+
+func hasHTMLAttribute(node *html.Node, name string) bool {
+	for _, attribute := range node.Attr {
+		if strings.EqualFold(attribute.Key, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) relayZitadelRegistration(w http.ResponseWriter, resp *http.Response, body []byte) error {
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	w.Header().Set("Cache-Control", "no-store")
+	copyResponseHeader(w.Header(), resp.Header, "Content-Language")
+	copyResponseHeader(w.Header(), resp.Header, "Content-Security-Policy")
+	copyResponseHeader(w.Header(), resp.Header, "Content-Security-Policy-Report-Only")
+	if w.Header().Get("Content-Security-Policy") == "" {
+		w.Header().Set("Content-Security-Policy", registrationFallbackPolicy)
+	}
+	// Multiple enforced CSP headers are intersected by browsers. Keep this
+	// service-owned guard even if ZITADEL supplies a more permissive policy.
+	w.Header().Add("Content-Security-Policy", registrationSecurityPolicy)
+	for _, cookie := range resp.Header.Values("Set-Cookie") {
+		w.Header().Add("Set-Cookie", cookie)
+	}
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(body); err != nil {
+		return fmt.Errorf("write ZITADEL registration response: %w", err)
+	}
+	return nil
+}
+
+func copyResponseHeader(destination http.Header, source http.Header, name string) {
+	for _, value := range source.Values(name) {
+		destination.Add(name, value)
+	}
 }
 
 func unsignedJWT(encoded string) string {
@@ -567,6 +880,10 @@ func classifyZitadelResponse(contentType string, body []byte) string {
 		return "invalid_signature"
 	case bytes.Contains(lower, []byte("invalid tokens provided")) && bytes.Contains(lower, []byte("expired")):
 		return "expired_token"
+	case bytes.Contains(lower, []byte("user-ucej2")):
+		return "profile_first_name_required"
+	case bytes.Contains(lower, []byte("user-4hb7d")):
+		return "profile_last_name_required"
 	case bytes.Contains(lower, []byte(`name="external-idp-config-id"`)):
 		return "external_user_action_required"
 	case bytes.Contains(lower, []byte("/ui/login/mail/verification")):

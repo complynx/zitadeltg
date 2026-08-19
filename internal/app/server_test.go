@@ -206,6 +206,8 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 		"exp":                   now.Add(time.Hour).Unix(),
 		"nonce":                 verifiedState.Nonce,
 		"name":                  "Jane Doe",
+		"given_name":            "Jane",
+		"family_name":           "Doe",
 		"preferred_username":    "jane",
 		"phone_number":          "15555550123",
 		"phone_number_verified": true,
@@ -235,6 +237,8 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, parsed.Valid)
 	assert.Equal(t, fakeEmail(bot.ID, "telegram-sub", cfg.EmailDomain), payload["email"])
+	assert.Equal(t, "Jane", payload["given_name"])
+	assert.Equal(t, "Doe", payload["family_name"])
 	assert.Equal(t, false, payload["email_verified"])
 	assert.Equal(t, cfg.JWT.Audience, payload["aud"])
 	assert.Equal(t, "15555550123", payload["phone"])
@@ -485,6 +489,45 @@ func TestIssueZitadelJWTDoesNotForwardUnrequestedPhone(t *testing.T) {
 	assert.NotContains(t, claims, "phone")
 }
 
+func TestZitadelProfileNames(t *testing.T) {
+	tests := []struct {
+		name       string
+		user       TelegramUser
+		wantGiven  string
+		wantFamily string
+	}{
+		{name: "explicit claims", user: TelegramUser{Name: "Display Name", GivenName: "Given", FamilyName: "Family"}, wantGiven: "Given", wantFamily: "Family"},
+		{name: "split display name", user: TelegramUser{Name: "Daniel Joseph Drizhuk"}, wantGiven: "Daniel", wantFamily: "Joseph Drizhuk"},
+		{name: "single name", user: TelegramUser{Name: "Prince"}, wantGiven: "Prince", wantFamily: "Prince"},
+		{name: "username fallback", user: TelegramUser{PreferredUsername: "complynx"}, wantGiven: "complynx", wantFamily: "complynx"},
+		{name: "anonymous fallback", user: TelegramUser{}, wantGiven: "Telegram", wantFamily: "Telegram"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			given, family := zitadelProfileNames(tt.user)
+			assert.Equal(t, tt.wantGiven, given)
+			assert.Equal(t, tt.wantFamily, family)
+		})
+	}
+}
+
+func TestZitadelDisplayNamePreservesExistingFallbacks(t *testing.T) {
+	tests := []struct {
+		name string
+		user TelegramUser
+		want string
+	}{
+		{name: "display name", user: TelegramUser{Name: "Jane Doe", PreferredUsername: "jane"}, want: "Jane Doe"},
+		{name: "username", user: TelegramUser{PreferredUsername: "complynx"}, want: "complynx"},
+		{name: "subject", user: TelegramUser{}, want: "Telegram user subject-1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, zitadelDisplayName(tt.user, "subject-1"))
+		})
+	}
+}
+
 func TestIssueZitadelJWTPreservesUnverifiedPhoneStatus(t *testing.T) {
 	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/idps/jwt")
 	signer := newTestSigner(t, "idp-key")
@@ -568,6 +611,252 @@ func TestZitadelRelayRejectsNonRedirectBodies(t *testing.T) {
 	assert.NotContains(t, logs.String(), signature)
 }
 
+// This is the security-relevant structure from the captured production
+// ZITADEL v4.15.0 response, with session identifiers replaced and the profile
+// values populated as expected after claim propagation.
+const testZitadelRegistrationForm = `<html><form action="/ui/login/externaluser/option?none=true" method="POST"><input type="hidden" name="gorilla.csrf.Token" value="sensitive-csrf"><input type="hidden" name="authRequestID" value="sensitive-request"><input type="hidden" name="external-idp-config-id" value="provider-1"><input type="text" name="firstname" value="Jane" required><input type="text" name="lastname" value="Doe" required><button type="submit" formaction="/ui/login/externaluser/option?autoregisterbutton=true">Register</button></form></html>`
+
+func TestZitadelRelayReturnsSameOriginRegistrationForm(t *testing.T) {
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/ui/login/login/jwt/authorize")
+	cfg.PublicURL = "https://zitadel.test/tg"
+	var logs bytes.Buffer
+	srv := &Server{
+		cfg:    cfg,
+		logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type":            []string{"text/html; charset=utf-8"},
+					"Content-Language":        []string{"en"},
+					"Content-Security-Policy": []string{"default-src 'self'; form-action 'self'"},
+					"Set-Cookie":              []string{"csrf=token; Path=/ui/login; Secure; HttpOnly; SameSite=Lax"},
+				},
+				Body: io.NopCloser(strings.NewReader(testZitadelRegistrationForm)),
+			}, nil
+		}),
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "https://zitadel.test/tg/auth/telegram/123", nil)
+	err := srv.proxyToZitadel(rr, req, "header.payload.signature-secret", "")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, testZitadelRegistrationForm, rr.Body.String())
+	assert.Equal(t, "text/html; charset=utf-8", rr.Header().Get("Content-Type"))
+	assert.Equal(t, "en", rr.Header().Get("Content-Language"))
+	assert.Equal(t, "default-src 'self'; form-action 'self'", rr.Header().Get("Content-Security-Policy"))
+	assert.Contains(t, rr.Header().Values("Content-Security-Policy"), registrationSecurityPolicy)
+	assert.Equal(t, "no-store", rr.Header().Get("Cache-Control"))
+	assert.Contains(t, strings.Join(rr.Header().Values("Set-Cookie"), ";"), "csrf=token")
+	assert.Contains(t, logs.String(), "registration_relayed=true")
+	assert.NotContains(t, logs.String(), "response_body")
+	assert.NotContains(t, logs.String(), "jwt_unsigned")
+	assert.NotContains(t, logs.String(), "sensitive-csrf")
+	assert.NotContains(t, logs.String(), "sensitive-request")
+	assert.NotContains(t, logs.String(), "signature-secret")
+}
+
+func TestZitadelRelayRejectsCrossOriginRegistrationForm(t *testing.T) {
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/ui/login/login/jwt/authorize")
+	cfg.PublicURL = "https://zitadel.test/tg"
+	var logs bytes.Buffer
+	srv := &Server{
+		cfg:    cfg,
+		logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type": []string{"text/html"},
+					"Set-Cookie":   []string{"secret=must-not-be-relayed"},
+				},
+				Body: io.NopCloser(strings.NewReader(testZitadelRegistrationForm)),
+			}, nil
+		}),
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "https://alternate.test/auth/telegram/123", nil)
+	err := srv.proxyToZitadel(rr, req, "header.payload.signature-secret", "")
+	require.Error(t, err)
+	assert.Equal(t, http.StatusBadGateway, rr.Code)
+	assert.Empty(t, rr.Header().Values("Set-Cookie"))
+	assert.Contains(t, logs.String(), "registration_sensitive=true")
+	assert.NotContains(t, logs.String(), "response_body")
+	assert.NotContains(t, logs.String(), "jwt_unsigned")
+	assert.NotContains(t, logs.String(), "sensitive-csrf")
+	assert.NotContains(t, logs.String(), "sensitive-request")
+}
+
+func TestZitadelRelayRejectsTruncatedRegistrationForm(t *testing.T) {
+	registration := testZitadelRegistrationForm + strings.Repeat("x", maxZitadelRegistrationBytes)
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/ui/login/login/jwt/authorize")
+	cfg.PublicURL = "https://zitadel.test/tg"
+	var logs bytes.Buffer
+	srv := &Server{
+		cfg:    cfg,
+		logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html"}, "Set-Cookie": []string{"secret=must-not-be-relayed"}},
+				Body:       io.NopCloser(strings.NewReader(registration)),
+			}, nil
+		}),
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "https://zitadel.test/auth/telegram/123", nil)
+	err := srv.proxyToZitadel(rr, req, "header.payload.signature-secret", "")
+	require.Error(t, err)
+	assert.Equal(t, http.StatusBadGateway, rr.Code)
+	assert.Empty(t, rr.Header().Values("Set-Cookie"))
+	assert.Contains(t, logs.String(), "response_truncated=true")
+	assert.Contains(t, logs.String(), "registration_sensitive=true")
+	assert.NotContains(t, logs.String(), "response_body")
+	assert.NotContains(t, logs.String(), "jwt_unsigned")
+	assert.NotContains(t, logs.String(), "sensitive-csrf")
+}
+
+func TestZitadelRelayRejectsInsecureRegistrationRequest(t *testing.T) {
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/ui/login/login/jwt/authorize")
+	cfg.PublicURL = "https://zitadel.test/tg"
+	srv := &Server{
+		cfg: cfg,
+		proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html"}, "Set-Cookie": []string{"secret=must-not-be-relayed"}},
+				Body:       io.NopCloser(strings.NewReader(testZitadelRegistrationForm)),
+			}, nil
+		}),
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "http://zitadel.test/auth/telegram/123", nil)
+	err := srv.proxyToZitadel(rr, req, "header.payload.signature-secret", "")
+	require.Error(t, err)
+	assert.Equal(t, http.StatusBadGateway, rr.Code)
+	assert.Empty(t, rr.Header().Values("Set-Cookie"))
+}
+
+func TestZitadelRelayDoesNotLogEntityEncodedRegistration(t *testing.T) {
+	entityEncoded := strings.NewReplacer(
+		"externaluser", "external&#117;ser",
+		"gorilla.csrf.Token", "gorilla&#46;csrf&#46;Token",
+		"authRequestID", "authRequest&#73;D",
+		"external-idp-config-id", "external-idp-config&#45;id",
+	).Replace(testZitadelRegistrationForm)
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/ui/login/login/jwt/authorize")
+	cfg.PublicURL = "https://zitadel.test/tg"
+	var logs bytes.Buffer
+	srv := &Server{
+		cfg:    cfg,
+		logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/html"}},
+				Body:       io.NopCloser(strings.NewReader(entityEncoded)),
+			}, nil
+		}),
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "https://zitadel.test/auth/telegram/123", nil)
+	require.NoError(t, srv.proxyToZitadel(rr, req, "header.payload.signature-secret", ""))
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, logs.String(), "registration_sensitive=true")
+	assert.NotContains(t, logs.String(), "response_body")
+	assert.NotContains(t, logs.String(), "jwt_unsigned")
+	assert.NotContains(t, logs.String(), "sensitive-csrf")
+}
+
+func TestZitadelRegistrationRelayTrustsForwardedHTTPSOnlyFromConfiguredProxy(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		wantOK     bool
+	}{
+		{name: "trusted proxy", remoteAddr: "10.0.0.2:443", wantOK: true},
+		{name: "untrusted sender", remoteAddr: "203.0.113.4:443"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/ui/login/login/jwt/authorize")
+			cfg.PublicURL = "https://zitadel.test/tg"
+			cfg.Proxy.TrustedCIDRs = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}
+			srv := &Server{
+				cfg: cfg,
+				proxyClient: fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"text/html"}},
+						Body:       io.NopCloser(strings.NewReader(testZitadelRegistrationForm)),
+					}, nil
+				}),
+			}
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "http://zitadel.test/auth/telegram/123", nil)
+			req.RemoteAddr = tt.remoteAddr
+			req.Header.Set("X-Forwarded-Proto", "https")
+			err := srv.proxyToZitadel(rr, req, "header.payload.signature-secret", "")
+			if tt.wantOK {
+				require.NoError(t, err)
+				assert.Equal(t, http.StatusOK, rr.Code)
+				return
+			}
+			require.Error(t, err)
+			assert.Equal(t, http.StatusBadGateway, rr.Code)
+		})
+	}
+}
+
+func TestZitadelRegistrationFormRecognitionIsStrict(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "complete form", body: testZitadelRegistrationForm, want: true},
+		{name: "error code only", body: `<div title="USER-UCej2">First name is empty</div>`},
+		{name: "marker in comment", body: `<!-- <input name="external-idp-config-id"> -->`},
+		{name: "wrong action", body: strings.Replace(testZitadelRegistrationForm, zitadelExternalUserFormPath, "/unexpected", 1)},
+		{name: "missing post method", body: strings.Replace(testZitadelRegistrationForm, ` method="POST"`, "", 1)},
+		{name: "empty csrf", body: strings.Replace(testZitadelRegistrationForm, `value="sensitive-csrf"`, `value=""`, 1)},
+		{name: "readonly first name", body: strings.Replace(testZitadelRegistrationForm, `name="firstname"`, `name="firstname" readonly`, 1)},
+		{name: "optional first name", body: strings.Replace(testZitadelRegistrationForm, `value="Jane" required`, `value="Jane"`, 1)},
+		{name: "hidden first name", body: strings.Replace(testZitadelRegistrationForm, `name="firstname"`, `name="firstname" hidden`, 1)},
+		{name: "reassociated csrf", body: strings.Replace(testZitadelRegistrationForm, `name="gorilla.csrf.Token"`, `name="gorilla.csrf.Token" form="other"`, 1)},
+		{name: "get formmethod", body: strings.Replace(testZitadelRegistrationForm, `type="submit"`, `type="submit" formmethod="GET"`, 1)},
+		{name: "disabled fieldset", body: strings.Replace(testZitadelRegistrationForm, `<input type="text" name="firstname" value="Jane" required>`, `<fieldset disabled><input type="text" name="firstname" value="Jane" required></fieldset>`, 1)},
+		{name: "duplicate required field", body: strings.Replace(testZitadelRegistrationForm, `</form>`, `<input type="text" name="firstname" value="Other" required></form>`, 1)},
+		{name: "second form", body: strings.Replace(testZitadelRegistrationForm, `</html>`, `<form method="POST" action="/ui/login/externaluser/option?none=true"></form></html>`, 1)},
+		{name: "external form action", body: strings.Replace(testZitadelRegistrationForm, `/ui/login/externaluser/option?autoregisterbutton=true`, `https://evil.test/register`, 1)},
+		{name: "external base", body: strings.Replace(testZitadelRegistrationForm, `<html>`, `<html><base href="https://evil.test/">`, 1)},
+		{name: "non html", body: testZitadelRegistrationForm},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			contentType := "text/html"
+			if tt.name == "non html" {
+				contentType = "text/plain"
+			}
+			assert.Equal(t, tt.want, isZitadelRegistrationForm([]byte(tt.body), contentType, http.StatusOK))
+		})
+	}
+}
+
+func TestPotentialZitadelRegistrationIsContentTypeAndStatusIndependent(t *testing.T) {
+	assert.True(t, isPotentialZitadelRegistration([]byte(`<input name="gorilla.csrf.Token" value="secret">`)))
+	assert.True(t, isPotentialZitadelRegistration([]byte(`<form action="/ui/login/externaluser/option?none=true">`)))
+	entityEncoded := strings.NewReplacer(
+		"externaluser", "external&#117;ser",
+		"gorilla.csrf.Token", "gorilla&#46;csrf&#46;Token",
+		"authRequestID", "authRequest&#73;D",
+		"external-idp-config-id", "external-idp-config&#45;id",
+	).Replace(testZitadelRegistrationForm)
+	assert.True(t, isZitadelRegistrationForm([]byte(entityEncoded), "text/html", http.StatusOK))
+	assert.True(t, isPotentialZitadelRegistration([]byte(entityEncoded)))
+	assert.False(t, isPotentialZitadelRegistration([]byte(`<html>ordinary error</html>`)))
+}
+
 func TestZitadelRelayDiagnosticsAreDisabledAtInfo(t *testing.T) {
 	var logs bytes.Buffer
 	srv := &Server{
@@ -610,8 +899,8 @@ func TestZitadelRelayDiagnosticsReportBodyCompleteness(t *testing.T) {
 		wantTruncated  bool
 		wantReadFailed bool
 	}{
-		{name: "exact limit", body: io.NopCloser(strings.NewReader(strings.Repeat("x", maxZitadelResponseBytes)))},
-		{name: "over limit", body: io.NopCloser(strings.NewReader(strings.Repeat("x", maxZitadelResponseBytes+1))), wantTruncated: true},
+		{name: "exact limit", body: io.NopCloser(strings.NewReader(strings.Repeat("x", maxZitadelRegistrationBytes)))},
+		{name: "over limit", body: io.NopCloser(strings.NewReader(strings.Repeat("x", maxZitadelRegistrationBytes+1))), wantTruncated: true},
 		{name: "partial read error", body: &partialErrorReadCloser{}, wantReadFailed: true},
 	}
 	for _, tt := range tests {
@@ -673,6 +962,8 @@ func TestClassifyZitadelResponseReturnsOnlySafeCategories(t *testing.T) {
 		{name: "token missing", contentType: "text/html; charset=utf-8", body: `<p class="lgn-error-message">Token not found (LOGIN-adh42)</p>`, want: "token_not_found"},
 		{name: "invalid issuer", contentType: "text/html", body: `<p>invalid tokens provided: invalid issuer: secret-value</p>`, want: "invalid_issuer"},
 		{name: "invalid signature", contentType: "text/html", body: `<p>invalid tokens provided: invalid signature: secret-value</p>`, want: "invalid_signature"},
+		{name: "first name required", contentType: "text/html", body: `<div title="USER-UCej2">First name in profile is empty</div>`, want: "profile_first_name_required"},
+		{name: "last name required", contentType: "text/html", body: `<div title="USER-4hB7d">Last name in profile is empty</div>`, want: "profile_last_name_required"},
 		{name: "email verification", contentType: "text/html", body: `<form action="/ui/login/mail/verification">`, want: "email_verification_required"},
 		{name: "external user action", contentType: "text/html", body: `<input name="external-idp-config-id" value="sensitive-user-value">`, want: "external_user_action_required"},
 		{name: "stable error id", contentType: "text/html", body: `<p>translated message (APP-9sdp4)</p>`, want: "zitadel_error"},

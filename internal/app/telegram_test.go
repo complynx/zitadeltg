@@ -69,6 +69,8 @@ func TestTelegramValidatorValidatesSignedIDToken(t *testing.T) {
 		"exp":                   now.Add(time.Hour).Unix(),
 		"nonce":                 "nonce-1",
 		"name":                  "Jane Doe",
+		"given_name":            "Jane",
+		"family_name":           "Doe",
 		"preferred_username":    "janedoe",
 		"picture":               "https://example.com/p.jpg",
 		"phone_number":          "15555550123",
@@ -79,6 +81,8 @@ func TestTelegramValidatorValidatesSignedIDToken(t *testing.T) {
 	user, err := validator.Validate(context.Background(), token, "123456789", "nonce-1")
 	require.NoError(t, err)
 	assert.Equal(t, "tg-subject", user.Subject)
+	assert.Equal(t, "Jane", user.GivenName)
+	assert.Equal(t, "Doe", user.FamilyName)
 	assert.Equal(t, "15555550123", user.PhoneNumber)
 	assert.True(t, user.PhoneNumberVerified)
 }

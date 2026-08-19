@@ -18,6 +18,8 @@ import (
 type TelegramUser struct {
 	Subject             string
 	Name                string
+	GivenName           string
+	FamilyName          string
 	PreferredUsername   string
 	Picture             string
 	PhoneNumber         string
@@ -33,6 +35,8 @@ type TelegramValidator struct {
 
 type telegramClaims struct {
 	Name                string `json:"name,omitempty"`
+	GivenName           string `json:"given_name,omitempty"`
+	FamilyName          string `json:"family_name,omitempty"`
 	PreferredUsername   string `json:"preferred_username,omitempty"`
 	Picture             string `json:"picture,omitempty"`
 	PhoneNumber         string `json:"phone_number,omitempty"`
@@ -262,6 +266,8 @@ func (v *TelegramValidator) Validate(ctx context.Context, token string, botID st
 	return TelegramUser{
 		Subject:             claims.Subject,
 		Name:                claims.Name,
+		GivenName:           claims.GivenName,
+		FamilyName:          claims.FamilyName,
 		PreferredUsername:   claims.PreferredUsername,
 		Picture:             claims.Picture,
 		PhoneNumber:         claims.PhoneNumber,

@@ -21,9 +21,10 @@ Routes are suffix-matched, so the same service also works behind path prefixes
 such as `/tg/login/BOT_ID` and `/tg/keys` when a proxy does not strip the prefix.
 ZITADEL's callback query parameters are strictly parsed, duplicate names are
 rejected, and the canonicalized query is signed before it is relayed. The
-service accepts only redirect responses from ZITADEL and never serves upstream
-HTML or error bodies under its own origin. Every accepted redirect is returned
-as `303 See Other`, so the browser never forwards the credential-bearing POST.
+service accepts redirect responses from ZITADEL and one narrowly recognized
+ZITADEL v4.15 manual-registration form; all other upstream HTML and error bodies
+are rejected. Every accepted redirect is returned as `303 See Other`, so the
+browser never forwards the credential-bearing POST.
 Same-origin ZITADEL redirects are accepted automatically. Add every permitted
 cross-origin application origin to `zitadel.redirect_origins`; scheme, host, and
 non-default port are matched exactly. `zitadel.allow_any_redirect_origin: true`
@@ -51,7 +52,9 @@ audience; when `jwt.audience` is omitted it defaults to
 `zitadel.jwt_endpoint`.
 
 `public_url` is the canonical external identity used as the default `issuer`;
-it does not constrain request `Host` headers or route matching.
+it does not constrain general route matching. Relaying the manual-registration
+form additionally requires the actual request `Host`, `public_url`, and the
+ZITADEL callback to have the same HTTPS origin.
 
 `synthetic_email_verified` defaults to `false`. ZITADEL Login V1 requires a
 verified email before it completes authentication, so deployments using
@@ -149,6 +152,11 @@ The digest prevents different subjects that sanitize to the same text from
 sharing an address. The service does not use Telegram's optional custom `id`
 claim for identity.
 
+The relay preserves Telegram's standard `given_name` and `family_name` claims
+for ZITADEL user creation. If Telegram omits either claim, the service derives
+it from `name`; a single-name profile uses the same value for both fields
+because ZITADEL v4.15.0 requires both fields during external-user registration.
+
 ## ZITADEL Setup
 
 Create a JWT IdP in ZITADEL with:
@@ -163,6 +171,17 @@ Create a JWT IdP in ZITADEL with:
 If `synthetic_email_verified` is enabled, disable email-based automatic linking
 on the ZITADEL identity provider. Resolve users by the external issuer and
 `sub`; the asserted email is synthetic and proves no mailbox ownership.
+
+For new users to review and edit their Telegram-supplied first and last names,
+enable manual account creation but disable **Automatic creation** on the JWT
+provider. ZITADEL then returns its registration form, prefilled from
+`given_name` and `family_name`; the relay serves that recognized form only when
+the configured ZITADEL callback, `public_url`, and actual request host share the
+same HTTPS origin. The form submission goes directly back to ZITADEL. The
+shared virtual host must route `/ui/login/externaluser/option` and ZITADEL's
+referenced `/ui/login/resources/` assets to ZITADEL, while routing only the
+configured zitadeltg prefix to this service. Preserve the original `Host` and
+supply HTTPS forwarding headers only from a proxy in `proxy.trusted_cidrs`.
 
 Set `zitadel.jwt_endpoint` in this service to the ZITADEL login callback:
 
@@ -210,13 +229,14 @@ ZITADEL relay metadata. Logs use finite route labels instead of raw request
 paths. Request paths and query strings, client IP addresses, Telegram ID
 tokens, bot tokens, state values, and session cookies are not logged.
 
-For a failed ZITADEL relay, `log_level: debug` additionally logs the ZITADEL
+For a failed ZITADEL relay, `log_level: debug` may additionally log the ZITADEL
 response body (bounded to 32 KiB) and the generated relay JWT as
 `jwt_unsigned=header.payload`. The dedicated field omits the signature, and
 compact JWTs reflected in the upstream body are redacted on a best-effort
 basis, but unsigned claims and the remaining response can contain identity or
 session data. Enable debug only for a short reproduction, restrict access to
-the logs, then restore `info` and delete the diagnostic log.
+the logs, then restore `info` and delete the diagnostic log. Registration-shaped
+responses and their JWTs are never included, whether relayed or rejected.
 
 The login page loads Telegram's official Login library from
 `oauth.telegram.org`; that script is therefore part of the authentication trust
