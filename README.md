@@ -159,6 +159,10 @@ claim:
 tg+BOT_ID+TELEGRAM_USER_ID@email_domain
 ```
 
+The signed `id` claim is accepted in Telegram's observed decimal-string form
+as well as its documented JSON-number form; both must use the same positive,
+canonical decimal representation within Telegram's 52-bit ID range.
+
 Synthetic addresses are sent with the configured `synthetic_email_verified`
 value; configure ZITADEL to identify users by `sub`, not by matching these
 addresses to existing accounts.
@@ -245,8 +249,12 @@ do not include Telegram user IDs, IP addresses, ID tokens, or bot secrets.
 At `debug`, the service also records request completion status, response size
 and duration; safe authentication-stage milestones; JWKS initialization; and
 ZITADEL relay metadata. Logs use finite route labels instead of raw request
-paths. Request paths and query strings, client IP addresses, Telegram ID
-tokens, bot tokens, state values, and session cookies are not logged.
+paths. Request paths and query strings, client IP addresses, bot tokens, state
+values, and session cookies are not logged. After a login state is accepted,
+the Telegram ID token is logged as
+`telegram_jwt_unsigned=header.payload`; its signature is omitted, but the
+remaining value contains the raw encoded identity, profile, phone, nonce, and
+timing claims.
 
 For a failed ZITADEL relay, `log_level: debug` may additionally log the ZITADEL
 response body (bounded to 32 KiB) and the generated relay JWT as
@@ -255,7 +263,9 @@ compact JWTs reflected in the upstream body are redacted on a best-effort
 basis, but unsigned claims and the remaining response can contain identity or
 session data. Enable debug only for a short reproduction, restrict access to
 the logs, then restore `info` and delete the diagnostic log. Registration-shaped
-responses and their JWTs are never included, whether relayed or rejected.
+ZITADEL responses and their relay JWTs are never included, whether relayed or
+rejected; the incoming Telegram token dump described above is independent of
+that suppression.
 
 The login page loads Telegram's official Login library from
 `oauth.telegram.org`; that script is therefore part of the authentication trust

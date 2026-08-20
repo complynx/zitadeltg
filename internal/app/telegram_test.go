@@ -159,7 +159,8 @@ func TestTelegramValidatorRejectsMissingOrInvalidUserID(t *testing.T) {
 		{name: "fractional", id: 1.5, wantErr: errTelegramUserIDInvalid},
 		{name: "zero", id: 0, wantErr: errTelegramUserIDInvalid},
 		{name: "negative", id: -1, wantErr: errTelegramUserIDInvalid},
-		{name: "string", id: "987654321", wantErr: errTelegramUserIDInvalid},
+		{name: "empty string", id: "", wantErr: errTelegramUserIDInvalid},
+		{name: "noncanonical string", id: "0987654321", wantErr: errTelegramUserIDInvalid},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -177,6 +178,28 @@ func TestTelegramValidatorRejectsMissingOrInvalidUserID(t *testing.T) {
 			require.ErrorIs(t, err, tt.wantErr)
 		})
 	}
+}
+
+func TestTelegramValidatorAcceptsDecimalStringUserID(t *testing.T) {
+	signer := newTestSigner(t, "telegram-key")
+	client := fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+		return jsonHTTPResponse(http.StatusOK, signer.JWKS()), nil
+	})
+	validator, err := NewTelegramValidator(context.Background(), TelegramConfig{
+		Issuer: defaultTelegramIssuer, JWKSURL: "https://telegram.test/jwks",
+		JWKSCacheTTL: time.Hour, ClockSkew: 30 * time.Second,
+	}, client)
+	require.NoError(t, err)
+
+	now := time.Now()
+	token, err := signer.Sign(map[string]any{
+		"iss": defaultTelegramIssuer, "aud": "123456789", "sub": "tg-subject",
+		"id": "987654321", "iat": now.Unix(), "exp": now.Add(time.Hour).Unix(), "nonce": "nonce-1",
+	})
+	require.NoError(t, err)
+	user, err := validator.Validate(context.Background(), token, "123456789", "nonce-1")
+	require.NoError(t, err)
+	assert.Equal(t, "987654321", user.TelegramID)
 }
 
 func TestCanonicalTelegramID(t *testing.T) {

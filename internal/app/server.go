@@ -240,14 +240,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request, prefix stri
 		scopes = append(scopes, "phone")
 	}
 	data := loginTemplateData{
-		BotID:         bot.ID,
-		BotName:       bot.Name,
-		Lang:          bot.Lang,
-		Scopes:        scopes,
-		Nonce:         nonce,
-		State:         state,
-		AuthAction:    joinURLPath(prefix, "auth/telegram", bot.ID),
-		CSPNonce:      cspNonce,
+		BotID:      bot.ID,
+		BotName:    bot.Name,
+		Lang:       bot.Lang,
+		Scopes:     scopes,
+		Nonce:      nonce,
+		State:      state,
+		AuthAction: joinURLPath(prefix, "auth/telegram", bot.ID),
+		CSPNonce:   cspNonce,
 	}
 	var page bytes.Buffer
 	if err := s.loginPage.Execute(&page, data); err != nil {
@@ -332,6 +332,10 @@ func (s *Server) handleTelegramAuth(w http.ResponseWriter, r *http.Request, botI
 		return
 	}
 	s.debugRequest(r, "telegram auth state accepted", slog.String("bot_id", botID))
+	s.debugRequest(r, "telegram id token received",
+		slog.String("bot_id", botID),
+		slog.String("telegram_jwt_unsigned", unsignedJWT(idToken)),
+	)
 	user, err := s.telegram.Validate(r.Context(), idToken, bot.ID, state.Nonce)
 	if err != nil {
 		s.logger.Warn("telegram token validation failed", requestAttrs(r,
@@ -979,14 +983,14 @@ func (s *Server) secureCookies(r *http.Request) bool {
 }
 
 type loginTemplateData struct {
-	BotID         string
-	BotName       string
-	Lang          string
-	Scopes        []string
-	Nonce         string
-	State         string
-	AuthAction    string
-	CSPNonce      string
+	BotID      string
+	BotName    string
+	Lang       string
+	Scopes     []string
+	Nonce      string
+	State      string
+	AuthAction string
+	CSPNonce   string
 }
 
 type responseMetricsWriter struct {

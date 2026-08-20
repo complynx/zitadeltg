@@ -297,11 +297,17 @@ func telegramIDFromClaim(value any) (string, error) {
 	if value == nil {
 		return "", errTelegramUserIDMissing
 	}
-	number, ok := value.(json.Number)
-	if !ok {
+	switch id := value.(type) {
+	case json.Number:
+		return canonicalTelegramID(id.String())
+	case string:
+		if id == "" {
+			return "", errTelegramUserIDInvalid
+		}
+		return canonicalTelegramID(id)
+	default:
 		return "", errTelegramUserIDInvalid
 	}
-	return canonicalTelegramID(number.String())
 }
 
 func canonicalTelegramID(raw string) (string, error) {

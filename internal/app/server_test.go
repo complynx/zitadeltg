@@ -209,6 +209,8 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 	idpSigner := newTestSigner(t, "idp-key")
 	srv, err := NewServer(context.Background(), cfg, idpSigner, client)
 	require.NoError(t, err)
+	var logs bytes.Buffer
+	srv.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	bot := cfg.Bots[0]
 	loginReq := httptest.NewRequest(http.MethodGet, "https://zitadel.test/prefix/login/"+bot.ID+"?requestID=abc&foo=bar", nil)
@@ -265,6 +267,10 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}))
 	require.NoError(t, err)
 	require.True(t, parsed.Valid)
+	idTokenParts := strings.Split(idToken, ".")
+	require.Len(t, idTokenParts, 3)
+	assert.Contains(t, logs.String(), "telegram_jwt_unsigned="+unsignedJWT(idToken))
+	assert.NotContains(t, logs.String(), idTokenParts[2])
 	assert.Equal(t, "telegram:"+bot.ID+":telegram-sub", payload["sub"])
 	assert.Equal(t, telegramIdentityEmail(bot.ID, "777000", cfg.EmailDomain), payload["email"])
 	assert.Equal(t, "telegram-sub", payload["urn:zitadeltg:telegram:subject"])
@@ -285,6 +291,77 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 	srv.ServeHTTP(replayRR, replayReq)
 	assert.Equal(t, http.StatusBadRequest, replayRR.Code)
 	assert.Equal(t, 1, zitadelCalls)
+}
+
+func TestTelegramAuthDebugTokenLoggingBoundary(t *testing.T) {
+	trustedSigner := newTestSigner(t, "trusted-telegram-key")
+	untrustedSigner := newTestSigner(t, "untrusted-telegram-key")
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/idps/jwt")
+	srv, err := NewServer(context.Background(), cfg, newTestSigner(t, "idp-key"), fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Host == "telegram.test" {
+			return jsonHTTPResponse(http.StatusOK, trustedSigner.JWKS()), nil
+		}
+		return nil, errors.New("unexpected upstream request")
+	}))
+	require.NoError(t, err)
+
+	var logs bytes.Buffer
+	srv.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	bot := cfg.Bots[0]
+	startLogin := func() (string, string, *http.Cookie) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/login/"+bot.ID, nil))
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+		require.Len(t, rr.Result().Cookies(), 1)
+		state := loginStateFromHTML(t, rr.Body.String())
+		verified, err := verifyState(bot, state, time.Now(), cfg.StateTTL)
+		require.NoError(t, err)
+		return state, verified.Nonce, rr.Result().Cookies()[0]
+	}
+	postToken := func(state string, cookie *http.Cookie, idToken string) *httptest.ResponseRecorder {
+		t.Helper()
+		form := url.Values{"id_token": {idToken}, "state": {state}}
+		req := httptest.NewRequest(http.MethodPost, "/auth/telegram/"+bot.ID, strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(cookie)
+		rr := httptest.NewRecorder()
+		srv.ServeHTTP(rr, req)
+		return rr
+	}
+	invalidToken := func(nonce string) string {
+		t.Helper()
+		now := time.Now()
+		token, err := untrustedSigner.Sign(map[string]any{
+			"iss": defaultTelegramIssuer, "aud": bot.ID, "sub": "telegram-sub", "id": "777000",
+			"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(), "nonce": nonce,
+		})
+		require.NoError(t, err)
+		return token
+	}
+
+	state, nonce, cookie := startLogin()
+	idToken := invalidToken(nonce)
+	logs.Reset()
+	rr := postToken(state, cookie, idToken)
+	require.Equal(t, http.StatusUnauthorized, rr.Code, rr.Body.String())
+	parts := strings.Split(idToken, ".")
+	require.Len(t, parts, 3)
+	assert.Contains(t, logs.String(), "telegram_jwt_unsigned="+unsignedJWT(idToken))
+	assert.NotContains(t, logs.String(), parts[2])
+
+	logs.Reset()
+	replayRR := postToken(state, cookie, idToken)
+	require.Equal(t, http.StatusBadRequest, replayRR.Code, replayRR.Body.String())
+	assert.NotContains(t, logs.String(), "telegram_jwt_unsigned=")
+
+	state, nonce, cookie = startLogin()
+	idToken = invalidToken(nonce)
+	logs.Reset()
+	srv.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	rr = postToken(state, cookie, idToken)
+	require.Equal(t, http.StatusUnauthorized, rr.Code, rr.Body.String())
+	assert.NotContains(t, logs.String(), "telegram_jwt_unsigned=")
 }
 
 func TestConcurrentLoginStatesUseOneBoundedSessionCookie(t *testing.T) {
