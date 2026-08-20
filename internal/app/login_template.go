@@ -179,7 +179,8 @@ const loginHTML = `<!doctype html>
       }
     }
 
-    button.addEventListener("click", openTelegramLogin);
+    document.addEventListener("click", openTelegramLogin);
+    document.addEventListener("mousemove", openTelegramLogin, { once: true });
     telegramScript.addEventListener("error", function () {
       setBusy(false);
       setStatus("Telegram login could not be loaded. Please reload and try again.", true);
