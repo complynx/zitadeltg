@@ -35,12 +35,32 @@ func TestLoginPageUsesRequestPrefix(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 	body := rr.Body.String()
 	assert.Contains(t, body, `"/prefix/auth/telegram/123456789"`)
-	assert.Contains(t, body, `"write"`)
+	assert.Contains(t, body, `"profile"`)
+	assert.Contains(t, body, `"telegram:bot_access"`)
 	assert.Contains(t, body, `"phone"`)
+	assert.NotContains(t, body, "request_access")
 	assert.Contains(t, rr.Header().Get("Content-Security-Policy"), "https://oauth.telegram.org")
 	assert.Equal(t, "same-origin-allow-popups", rr.Header().Get("Cross-Origin-Opener-Policy"))
 	require.NotEmpty(t, rr.Result().Cookies())
 	assert.Less(t, len(rr.Result().Cookies()[0].Value), 100)
+}
+
+func TestLoginPageDoesNotRequestOptionalScopesWhenDisabled(t *testing.T) {
+	cfg := testConfig("https://telegram.example.test/jwks", "https://accounts.example.test/idps/jwt")
+	cfg.Bots[0].RequestWrite = false
+	cfg.Bots[0].RequestPhone = false
+	telegramSigner := newTestSigner(t, "telegram-key")
+	srv, err := NewServer(context.Background(), cfg, newTestSigner(t, "idp-key"), fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
+		return jsonHTTPResponse(http.StatusOK, telegramSigner.JWKS()), nil
+	}))
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/login/123456789", nil))
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	assert.Contains(t, rr.Body.String(), `scope: ["profile"]`)
+	assert.NotContains(t, rr.Body.String(), `"telegram:bot_access"`)
+	assert.NotContains(t, rr.Body.String(), `"phone"`)
 }
 
 func TestNewServerAddsTimeoutToInjectedClient(t *testing.T) {
@@ -245,7 +265,10 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}))
 	require.NoError(t, err)
 	require.True(t, parsed.Valid)
-	assert.Equal(t, fakeEmail(bot.ID, "telegram-sub", cfg.EmailDomain), payload["email"])
+	assert.Equal(t, "telegram:"+bot.ID+":telegram-sub", payload["sub"])
+	assert.Equal(t, telegramIdentityEmail(bot.ID, "777000", cfg.EmailDomain), payload["email"])
+	assert.Equal(t, "telegram-sub", payload["urn:zitadeltg:telegram:subject"])
+	assert.Equal(t, "777000", payload["urn:zitadeltg:telegram:user_id"])
 	assert.Equal(t, "Jane", payload["given_name"])
 	assert.Equal(t, "Doe", payload["family_name"])
 	assert.Equal(t, false, payload["email_verified"])
@@ -485,7 +508,7 @@ func TestIssueZitadelJWTDoesNotForwardUnrequestedPhone(t *testing.T) {
 	signer := newTestSigner(t, "idp-key")
 	srv := &Server{cfg: cfg, signer: signer}
 	token, err := srv.issueZitadelJWT(cfg.Bots[0], TelegramUser{
-		Subject: "subject", IssuedAt: time.Now().Unix(), PhoneNumber: "15555550123",
+		Subject: "subject", TelegramID: "123", IssuedAt: time.Now().Unix(), PhoneNumber: "15555550123",
 	})
 	require.NoError(t, err)
 	claims := jwt.MapClaims{}
@@ -496,6 +519,13 @@ func TestIssueZitadelJWTDoesNotForwardUnrequestedPhone(t *testing.T) {
 	require.True(t, parsed.Valid)
 	assert.NotContains(t, claims, "phone_number")
 	assert.NotContains(t, claims, "phone")
+}
+
+func TestIssueZitadelJWTRejectsMissingTelegramUserID(t *testing.T) {
+	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/idps/jwt")
+	srv := &Server{cfg: cfg, signer: newTestSigner(t, "idp-key")}
+	_, err := srv.issueZitadelJWT(cfg.Bots[0], TelegramUser{Subject: "subject", IssuedAt: time.Now().Unix()})
+	require.ErrorIs(t, err, errTelegramUserIDMissing)
 }
 
 func TestZitadelProfileNames(t *testing.T) {
@@ -542,7 +572,7 @@ func TestIssueZitadelJWTPreservesUnverifiedPhoneStatus(t *testing.T) {
 	signer := newTestSigner(t, "idp-key")
 	srv := &Server{cfg: cfg, signer: signer}
 	token, err := srv.issueZitadelJWT(cfg.Bots[0], TelegramUser{
-		Subject: "subject", IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Minute).Unix(),
+		Subject: "subject", TelegramID: "123", IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Minute).Unix(),
 		PhoneNumber: "15555550123", PhoneNumberVerified: false,
 	})
 	require.NoError(t, err)
@@ -557,28 +587,23 @@ func TestIssueZitadelJWTPreservesUnverifiedPhoneStatus(t *testing.T) {
 	assert.Equal(t, false, claims["phone_verified"])
 }
 
-func TestFakeEmailDoesNotCollideAfterSanitization(t *testing.T) {
-	first := fakeEmail("123", "abc/def", "telegram.invalid")
-	second := fakeEmail("123", "abc?def", "telegram.invalid")
-	assert.NotEqual(t, first, second)
-	assert.LessOrEqual(t, len(strings.Split(first, "@")[0]), 64)
+func TestTelegramIdentityEmailIsReadableAndDeterministic(t *testing.T) {
+	email := telegramIdentityEmail("123456789", "987654321", "TELEGRAM.INVALID")
+	assert.Equal(t, "tg+123456789+987654321@telegram.invalid", email)
 }
 
-func TestFakeEmailProducesValidDotAtom(t *testing.T) {
-	email := fakeEmail("123", "..A...B..", "telegram.invalid")
+func TestTelegramIdentityEmailProducesValidDotAtom(t *testing.T) {
+	email := telegramIdentityEmail("123456789", "987654321", "telegram.invalid")
 	parsed, err := mail.ParseAddress(email)
 	require.NoError(t, err)
 	assert.Equal(t, email, parsed.Address)
-	local, _, ok := strings.Cut(email, "@")
-	require.True(t, ok)
-	assert.NotContains(t, local, "..")
 }
 
-func TestFakeEmailStaysWithinMailboxLengthLimit(t *testing.T) {
+func TestTelegramIdentityEmailStaysWithinMailboxLengthLimit(t *testing.T) {
 	domain := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 61)
 	require.Len(t, domain, maxSyntheticEmailDomainBytes)
 	require.True(t, validEmailDomain(domain))
-	email := fakeEmail("123", strings.Repeat("subject", 30), domain)
+	email := telegramIdentityEmail("9007199254740991", "9007199254740991", domain)
 	assert.LessOrEqual(t, len(email), 254)
 }
 
@@ -1219,7 +1244,7 @@ func TestIssueZitadelJWTCapsSourceExpiryAndAuthTime(t *testing.T) {
 	now := time.Now()
 	sourceExpiry := now.Add(30 * time.Second).Unix()
 	token, err := srv.issueZitadelJWT(cfg.Bots[0], TelegramUser{
-		Subject: "subject", IssuedAt: now.Add(10 * time.Second).Unix(), ExpiresAt: sourceExpiry,
+		Subject: "subject", TelegramID: "123", IssuedAt: now.Add(10 * time.Second).Unix(), ExpiresAt: sourceExpiry,
 	})
 	require.NoError(t, err)
 	claims := jwt.MapClaims{}
@@ -1237,7 +1262,7 @@ func TestIssueZitadelJWTRejectsInsufficientRelayLifetime(t *testing.T) {
 	cfg := testConfig("https://telegram.test/jwks", "https://zitadel.test/idps/jwt")
 	srv := &Server{cfg: cfg, signer: newTestSigner(t, "idp-key")}
 	_, err := srv.issueZitadelJWT(cfg.Bots[0], TelegramUser{
-		Subject: "subject", IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(2 * time.Second).Unix(),
+		Subject: "subject", TelegramID: "123", IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(2 * time.Second).Unix(),
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "expires too soon")
@@ -1248,7 +1273,7 @@ func TestIssueZitadelJWTUsesConfiguredSyntheticEmailVerification(t *testing.T) {
 	cfg.SyntheticEmailVerified = true
 	signer := newTestSigner(t, "idp-key")
 	srv := &Server{cfg: cfg, signer: signer}
-	token, err := srv.issueZitadelJWT(cfg.Bots[0], TelegramUser{Subject: "subject", IssuedAt: time.Now().Unix()})
+	token, err := srv.issueZitadelJWT(cfg.Bots[0], TelegramUser{Subject: "subject", TelegramID: "123", IssuedAt: time.Now().Unix()})
 	require.NoError(t, err)
 
 	claims := jwt.MapClaims{}
@@ -1266,7 +1291,7 @@ func TestIssueZitadelJWTSerializedExpiryMeetsMinimumLifetime(t *testing.T) {
 	srv := &Server{cfg: cfg, signer: signer}
 	before := time.Now()
 	token, err := srv.issueZitadelJWT(cfg.Bots[0], TelegramUser{
-		Subject: "subject", IssuedAt: before.Unix(),
+		Subject: "subject", TelegramID: "123", IssuedAt: before.Unix(),
 	})
 	require.NoError(t, err)
 	claims := jwt.MapClaims{}

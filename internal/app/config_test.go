@@ -302,16 +302,20 @@ bots:
 	assert.Contains(t, err.Error(), "only one")
 }
 
-func TestParseConfigRejectsBotIDOutsideJavaScriptSafeRange(t *testing.T) {
-	_, err := ParseConfig([]byte(`
+func TestParseConfigRejectsBotIDOutsideTelegramRange(t *testing.T) {
+	for _, id := range []string{"4503599627370496", "9007199254740992"} {
+		t.Run(id, func(t *testing.T) {
+			_, err := ParseConfig([]byte(`
 issuer: "https://idp.example.com"
 zitadel:
   jwt_endpoint: "https://accounts.example.com/idps/jwt"
 bots:
-  - token: "9007199254740992:secret"
+  - token: "` + id + `:secret"
 `))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "safe integer")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "52-bit numeric ID range")
+		})
+	}
 }
 
 func TestParseConfigRejectsNonCanonicalBotIDs(t *testing.T) {

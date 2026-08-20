@@ -753,9 +753,9 @@ func parseBotToken(token string) (string, string, error) {
 			return "", "", fmt.Errorf("bot id %q must be numeric", id)
 		}
 	}
-	numericID, err := strconv.ParseUint(id, 10, 53)
-	if err != nil || numericID > (1<<53)-1 {
-		return "", "", fmt.Errorf("bot id %q exceeds JavaScript's safe integer range", id)
+	numericID, err := strconv.ParseUint(id, 10, 52)
+	if err != nil || numericID > uint64(maxTelegramNumericID) {
+		return "", "", fmt.Errorf("bot id %q exceeds Telegram's 52-bit numeric ID range", id)
 	}
 	if numericID == 0 {
 		return "", "", errors.New("bot id must be positive")

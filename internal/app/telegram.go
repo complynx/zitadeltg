@@ -3,12 +3,14 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/MicahParks/keyfunc/v3"
@@ -17,6 +19,7 @@ import (
 
 type TelegramUser struct {
 	Subject             string
+	TelegramID          string
 	Name                string
 	GivenName           string
 	FamilyName          string
@@ -34,6 +37,7 @@ type TelegramValidator struct {
 }
 
 type telegramClaims struct {
+	ID                  any    `json:"id,omitempty"`
 	Name                string `json:"name,omitempty"`
 	GivenName           string `json:"given_name,omitempty"`
 	FamilyName          string `json:"family_name,omitempty"`
@@ -48,6 +52,8 @@ type telegramClaims struct {
 var (
 	errTelegramTokenInvalid    = errors.New("Telegram token is invalid")
 	errTelegramSubjectMissing  = errors.New("Telegram subject is missing")
+	errTelegramUserIDMissing   = errors.New("Telegram user ID is missing")
+	errTelegramUserIDInvalid   = errors.New("Telegram user ID is invalid")
 	errTelegramIssuedAtMissing = errors.New("Telegram issued-at time is missing")
 	errTelegramNonceMismatch   = errors.New("Telegram nonce does not match")
 )
@@ -56,6 +62,7 @@ const (
 	defaultHTTPTimeout          = 10 * time.Second
 	maxRemoteResponseHeaderSize = 64 << 10
 	maxJWKSBodyBytes            = 1 << 20
+	maxTelegramNumericID        = int64(1<<52 - 1)
 )
 
 type boundedJWKSTransport struct {
@@ -191,6 +198,10 @@ func telegramValidationErrorCategory(err error) string {
 		return "invalid_token"
 	case errors.Is(err, errTelegramSubjectMissing):
 		return "subject_missing"
+	case errors.Is(err, errTelegramUserIDMissing):
+		return "user_id_missing"
+	case errors.Is(err, errTelegramUserIDInvalid):
+		return "user_id_invalid"
 	case errors.Is(err, errTelegramIssuedAtMissing):
 		return "issued_at_missing"
 	case errors.Is(err, errTelegramNonceMismatch):
@@ -256,6 +267,10 @@ func (v *TelegramValidator) Validate(ctx context.Context, token string, botID st
 	if claims.Subject == "" {
 		return TelegramUser{}, errTelegramSubjectMissing
 	}
+	telegramID, err := telegramIDFromClaim(claims.ID)
+	if err != nil {
+		return TelegramUser{}, err
+	}
 	if claims.IssuedAt == nil {
 		return TelegramUser{}, errTelegramIssuedAtMissing
 	}
@@ -265,6 +280,7 @@ func (v *TelegramValidator) Validate(ctx context.Context, token string, botID st
 
 	return TelegramUser{
 		Subject:             claims.Subject,
+		TelegramID:          telegramID,
 		Name:                claims.Name,
 		GivenName:           claims.GivenName,
 		FamilyName:          claims.FamilyName,
@@ -275,6 +291,28 @@ func (v *TelegramValidator) Validate(ctx context.Context, token string, botID st
 		IssuedAt:            numericDateUnix(claims.IssuedAt),
 		ExpiresAt:           numericDateUnix(claims.ExpiresAt),
 	}, nil
+}
+
+func telegramIDFromClaim(value any) (string, error) {
+	if value == nil {
+		return "", errTelegramUserIDMissing
+	}
+	number, ok := value.(json.Number)
+	if !ok {
+		return "", errTelegramUserIDInvalid
+	}
+	return canonicalTelegramID(number.String())
+}
+
+func canonicalTelegramID(raw string) (string, error) {
+	if raw == "" {
+		return "", errTelegramUserIDMissing
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 || id > maxTelegramNumericID || strconv.FormatInt(id, 10) != raw {
+		return "", errTelegramUserIDInvalid
+	}
+	return raw, nil
 }
 
 func numericDateUnix(date *jwt.NumericDate) int64 {

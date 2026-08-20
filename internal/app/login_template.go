@@ -93,7 +93,7 @@ const loginHTML = `<!doctype html>
   <script nonce="{{ .CSPNonce }}">
     const loginOptions = {
       client_id: Number({{ .BotID | json }}),
-      request_access: {{ .RequestAccess | json }},
+      scope: {{ .Scopes | json }},
       nonce: {{ .Nonce | json }}{{ if .Lang }},
       lang: {{ .Lang | json }}{{ end }}
     };

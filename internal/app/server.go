@@ -231,18 +231,19 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request, prefix stri
 		s.error(w, http.StatusInternalServerError, "could not create login page")
 		return
 	}
-	access := make([]string, 0, 2)
+	scopes := make([]string, 0, 3)
+	scopes = append(scopes, "profile")
 	if bot.RequestWrite {
-		access = append(access, "write")
+		scopes = append(scopes, "telegram:bot_access")
 	}
 	if bot.RequestPhone {
-		access = append(access, "phone")
+		scopes = append(scopes, "phone")
 	}
 	data := loginTemplateData{
 		BotID:         bot.ID,
 		BotName:       bot.Name,
 		Lang:          bot.Lang,
-		RequestAccess: access,
+		Scopes:        scopes,
 		Nonce:         nonce,
 		State:         state,
 		AuthAction:    joinURLPath(prefix, "auth/telegram", bot.ID),
@@ -370,6 +371,10 @@ func (s *Server) handleTelegramAuth(w http.ResponseWriter, r *http.Request, botI
 }
 
 func (s *Server) issueZitadelJWT(bot BotConfig, user TelegramUser) (string, error) {
+	telegramID, err := canonicalTelegramID(user.TelegramID)
+	if err != nil {
+		return "", fmt.Errorf("validate Telegram user ID: %w", err)
+	}
 	now := time.Now()
 	expires := now.Add(s.cfg.JWT.TTL)
 	if user.ExpiresAt > 0 {
@@ -409,11 +414,12 @@ func (s *Server) issueZitadelJWT(bot BotConfig, user TelegramUser) (string, erro
 		"given_name":                      givenName,
 		"family_name":                     familyName,
 		"preferred_username":              username,
-		"email":                           fakeEmail(bot.ID, userID, s.cfg.EmailDomain),
+		"email":                           telegramIdentityEmail(bot.ID, telegramID, s.cfg.EmailDomain),
 		"email_verified":                  s.cfg.SyntheticEmailVerified,
 		"urn:zitadeltg:telegram:bot_id":   bot.ID,
 		"urn:zitadeltg:telegram:bot_name": bot.Name,
 		"urn:zitadeltg:telegram:subject":  userID,
+		"urn:zitadeltg:telegram:user_id":  telegramID,
 	}
 	claims["aud"] = s.cfg.JWT.Audience
 	if user.Picture != "" {
@@ -976,7 +982,7 @@ type loginTemplateData struct {
 	BotID         string
 	BotName       string
 	Lang          string
-	RequestAccess []string
+	Scopes        []string
 	Nonce         string
 	State         string
 	AuthAction    string
@@ -1116,15 +1122,8 @@ var (
 	compactJWTLogRe        = regexp.MustCompile(`[A-Za-z0-9_-]{3,}\.[A-Za-z0-9_-]{3,}\.[A-Za-z0-9_-]{16,}`)
 )
 
-func fakeEmail(botID string, userID string, domain string) string {
-	local := "tg+" + sanitizeLocalPart(botID) + "+" + sanitizeLocalPart(userID)
-	digest := sha256.Sum256([]byte(botID + "\x00" + userID))
-	suffix := "+" + base64.RawURLEncoding.EncodeToString(digest[:12])
-	if len(local) > 64-len(suffix) {
-		local = local[:64-len(suffix)]
-	}
-	local = strings.TrimRight(local, ".-+_") + suffix
-	return local + "@" + strings.ToLower(domain)
+func telegramIdentityEmail(botID string, telegramID string, domain string) string {
+	return "tg+" + botID + "+" + telegramID + "@" + strings.ToLower(domain)
 }
 
 func sanitizeLocalPart(value string) string {

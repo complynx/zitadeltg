@@ -145,22 +145,29 @@ For each bot:
 
 - `token` is `BOT_ID:BOT_SECRET`.
 - `name` is displayed on the login page and included in the bot-name claim.
-- `write` requests permission for direct messages.
-- `phone` requests the verified phone number claim.
+- The Telegram `profile` scope is always requested because its numeric `id`
+  claim is required for the synthetic identity email.
+- `write` requests the `telegram:bot_access` scope for direct messages.
+- `phone` requests the `phone` scope and relays the verified phone number in
+  the `phone`, `phone_verified`, `phone_number`, and `phone_number_verified`
+  claims.
 
-The fake email format uses a readable form of Telegram's OIDC `sub` plus a
-collision-resistant digest of the original bot/subject pair:
+The synthetic email is derived from the bot ID and Telegram's numeric `id`
+claim:
 
 ```text
-tg+BOT_ID+SANITIZED_SUBJECT+DIGEST@email_domain
+tg+BOT_ID+TELEGRAM_USER_ID@email_domain
 ```
 
 Synthetic addresses are sent with the configured `synthetic_email_verified`
 value; configure ZITADEL to identify users by `sub`, not by matching these
 addresses to existing accounts.
-The digest prevents different subjects that sanitize to the same text from
-sharing an address. The service does not use Telegram's optional custom `id`
-claim for identity.
+The external IdP identity remains `telegram:BOT_ID:OIDC_SUB`; the email is a
+deterministic lookup key for a bot runtime that knows the bot ID and numeric
+Telegram user ID. Existing users with the previous subject-derived address
+must authenticate again with automatic external-account updates enabled so
+ZITADEL can update the address before runtimes use the new lookup scheme; if
+automatic updates are disabled, migrate those addresses explicitly.
 
 The relay preserves Telegram's standard `given_name` and `family_name` claims
 for ZITADEL user creation. If Telegram omits either claim, the service derives

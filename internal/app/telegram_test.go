@@ -34,6 +34,8 @@ func TestTelegramValidationErrorCategory(t *testing.T) {
 		{err: jwt.ErrTokenInvalidClaims, want: "invalid_claims"},
 		{err: errTelegramTokenInvalid, want: "invalid_token"},
 		{err: errTelegramSubjectMissing, want: "subject_missing"},
+		{err: errTelegramUserIDMissing, want: "user_id_missing"},
+		{err: errTelegramUserIDInvalid, want: "user_id_invalid"},
 		{err: errTelegramIssuedAtMissing, want: "issued_at_missing"},
 		{err: errTelegramNonceMismatch, want: "nonce_mismatch"},
 		{err: context.Canceled, want: "canceled"},
@@ -81,6 +83,7 @@ func TestTelegramValidatorValidatesSignedIDToken(t *testing.T) {
 	user, err := validator.Validate(context.Background(), token, "123456789", "nonce-1")
 	require.NoError(t, err)
 	assert.Equal(t, "tg-subject", user.Subject)
+	assert.Equal(t, "987654321", user.TelegramID)
 	assert.Equal(t, "Jane", user.GivenName)
 	assert.Equal(t, "Doe", user.FamilyName)
 	assert.Equal(t, "15555550123", user.PhoneNumber)
@@ -106,13 +109,14 @@ func TestTelegramValidatorRejectsWrongNonce(t *testing.T) {
 		"iss":   defaultTelegramIssuer,
 		"aud":   "123456789",
 		"sub":   "tg-subject",
+		"id":    987654321,
 		"iat":   now.Unix(),
 		"exp":   now.Add(time.Hour).Unix(),
 		"nonce": "nonce-1",
 	})
 	require.NoError(t, err)
 	_, err = validator.Validate(context.Background(), token, "123456789", "nonce-2")
-	require.Error(t, err)
+	require.ErrorIs(t, err, errTelegramNonceMismatch)
 }
 
 func TestTelegramValidatorRejectsMissingIssuedAt(t *testing.T) {
@@ -127,7 +131,7 @@ func TestTelegramValidatorRejectsMissingIssuedAt(t *testing.T) {
 	require.NoError(t, err)
 	token, err := signer.Sign(map[string]any{
 		"iss": defaultTelegramIssuer, "aud": "123456789", "sub": "tg-subject",
-		"exp": time.Now().Add(time.Hour).Unix(), "nonce": "nonce-1",
+		"id": 987654321, "exp": time.Now().Add(time.Hour).Unix(), "nonce": "nonce-1",
 	})
 	require.NoError(t, err)
 	_, err = validator.Validate(context.Background(), token, "123456789", "nonce-1")
@@ -135,7 +139,7 @@ func TestTelegramValidatorRejectsMissingIssuedAt(t *testing.T) {
 	assert.Contains(t, err.Error(), "issued-at")
 }
 
-func TestTelegramValidatorUsesSubjectRegardlessOfCustomID(t *testing.T) {
+func TestTelegramValidatorRejectsMissingOrInvalidUserID(t *testing.T) {
 	signer := newTestSigner(t, "telegram-key")
 	client := fakeHTTPClient(func(req *http.Request) (*http.Response, error) {
 		return jsonHTTPResponse(http.StatusOK, signer.JWKS()), nil
@@ -145,15 +149,67 @@ func TestTelegramValidatorUsesSubjectRegardlessOfCustomID(t *testing.T) {
 		JWKSCacheTTL: time.Hour, ClockSkew: 30 * time.Second,
 	}, client)
 	require.NoError(t, err)
-	now := time.Now()
-	token, err := signer.Sign(map[string]any{
-		"iss": defaultTelegramIssuer, "aud": "123456789", "sub": "tg-subject",
-		"id": 1.5, "iat": now.Unix(), "exp": now.Add(time.Hour).Unix(), "nonce": "nonce-1",
-	})
-	require.NoError(t, err)
-	user, err := validator.Validate(context.Background(), token, "123456789", "nonce-1")
-	require.NoError(t, err)
-	assert.Equal(t, "tg-subject", user.Subject)
+
+	tests := []struct {
+		name    string
+		id      any
+		wantErr error
+	}{
+		{name: "missing", wantErr: errTelegramUserIDMissing},
+		{name: "fractional", id: 1.5, wantErr: errTelegramUserIDInvalid},
+		{name: "zero", id: 0, wantErr: errTelegramUserIDInvalid},
+		{name: "negative", id: -1, wantErr: errTelegramUserIDInvalid},
+		{name: "string", id: "987654321", wantErr: errTelegramUserIDInvalid},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Now()
+			claims := map[string]any{
+				"iss": defaultTelegramIssuer, "aud": "123456789", "sub": "tg-subject",
+				"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(), "nonce": "nonce-1",
+			}
+			if tt.id != nil {
+				claims["id"] = tt.id
+			}
+			token, err := signer.Sign(claims)
+			require.NoError(t, err)
+			_, err = validator.Validate(context.Background(), token, "123456789", "nonce-1")
+			require.ErrorIs(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestCanonicalTelegramID(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr error
+	}{
+		{name: "smallest", raw: "1"},
+		{name: "Telegram upper boundary", raw: "4503599627370495"},
+		{name: "missing", wantErr: errTelegramUserIDMissing},
+		{name: "zero", raw: "0", wantErr: errTelegramUserIDInvalid},
+		{name: "negative", raw: "-1", wantErr: errTelegramUserIDInvalid},
+		{name: "leading plus", raw: "+1", wantErr: errTelegramUserIDInvalid},
+		{name: "leading zero", raw: "01", wantErr: errTelegramUserIDInvalid},
+		{name: "fractional", raw: "1.0", wantErr: errTelegramUserIDInvalid},
+		{name: "exponent", raw: "1e3", wantErr: errTelegramUserIDInvalid},
+		{name: "above Telegram upper boundary", raw: "4503599627370496", wantErr: errTelegramUserIDInvalid},
+		{name: "max int64", raw: "9223372036854775807", wantErr: errTelegramUserIDInvalid},
+		{name: "int64 overflow", raw: "9223372036854775808", wantErr: errTelegramUserIDInvalid},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := canonicalTelegramID(tt.raw)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				assert.Empty(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.raw, got)
+		})
+	}
 }
 
 func TestRedactURLQuery(t *testing.T) {
