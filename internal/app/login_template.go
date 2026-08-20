@@ -87,7 +87,7 @@ const loginHTML = `<!doctype html>
   <main>
     <div class="brand">Telegram Login</div>
     <div class="bot">@{{ .BotName }}</div>
-    <button id="login-button" type="button">Log in with Telegram</button>
+    <button id="login-button" type="button">Click to start</button>
     <div id="status" class="status" aria-live="polite"></div>
   </main>
   <script nonce="{{ .CSPNonce }}">
@@ -180,7 +180,6 @@ const loginHTML = `<!doctype html>
     }
 
     document.addEventListener("click", openTelegramLogin);
-    document.addEventListener("mousemove", openTelegramLogin, { once: true });
     telegramScript.addEventListener("error", function () {
       setBusy(false);
       setStatus("Telegram login could not be loaded. Please reload and try again.", true);
