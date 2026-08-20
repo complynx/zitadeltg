@@ -150,7 +150,8 @@ For each bot:
 - `write` requests the `telegram:bot_access` scope for direct messages.
 - `phone` requests the `phone` scope and relays the verified phone number in
   the `phone`, `phone_verified`, `phone_number`, and `phone_number_verified`
-  claims.
+  claims. Telegram's digit-only value is normalized with a leading `+` before
+  it is relayed; existing leading plus signs are canonicalized to exactly one.
 
 The synthetic email is derived from the bot ID and Telegram's numeric `id`
 claim:

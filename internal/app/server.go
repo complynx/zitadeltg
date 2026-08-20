@@ -429,10 +429,11 @@ func (s *Server) issueZitadelJWT(bot BotConfig, user TelegramUser) (string, erro
 	if user.Picture != "" {
 		claims["picture"] = user.Picture
 	}
-	if bot.RequestPhone && user.PhoneNumber != "" {
-		claims["phone"] = user.PhoneNumber
+	phoneNumber := normalizeTelegramPhoneNumber(user.PhoneNumber)
+	if bot.RequestPhone && phoneNumber != "" {
+		claims["phone"] = phoneNumber
 		claims["phone_verified"] = user.PhoneNumberVerified
-		claims["phone_number"] = user.PhoneNumber
+		claims["phone_number"] = phoneNumber
 		claims["phone_number_verified"] = user.PhoneNumberVerified
 	}
 	return s.signer.Sign(claims)
@@ -1128,6 +1129,18 @@ var (
 
 func telegramIdentityEmail(botID string, telegramID string, domain string) string {
 	return "tg+" + botID + "+" + telegramID + "@" + strings.ToLower(domain)
+}
+
+func normalizeTelegramPhoneNumber(phoneNumber string) string {
+	phoneNumber = strings.TrimSpace(phoneNumber)
+	if phoneNumber == "" {
+		return ""
+	}
+	phoneNumber = strings.TrimLeft(phoneNumber, "+")
+	if phoneNumber == "" {
+		return ""
+	}
+	return "+" + phoneNumber
 }
 
 func sanitizeLocalPart(value string) string {

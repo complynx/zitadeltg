@@ -279,9 +279,9 @@ func TestTelegramAuthProxiesJWTToZitadel(t *testing.T) {
 	assert.Equal(t, "Doe", payload["family_name"])
 	assert.Equal(t, false, payload["email_verified"])
 	assert.Equal(t, cfg.JWT.Audience, payload["aud"])
-	assert.Equal(t, "15555550123", payload["phone"])
+	assert.Equal(t, "+15555550123", payload["phone"])
 	assert.Equal(t, true, payload["phone_verified"])
-	assert.Equal(t, "15555550123", payload["phone_number"])
+	assert.Equal(t, "+15555550123", payload["phone_number"])
 	assert.Equal(t, true, payload["phone_number_verified"])
 
 	replayReq := httptest.NewRequest(http.MethodPost, "https://zitadel.test/prefix/auth/telegram/"+bot.ID, strings.NewReader(form.Encode()))
@@ -659,9 +659,32 @@ func TestIssueZitadelJWTPreservesUnverifiedPhoneStatus(t *testing.T) {
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}))
 	require.NoError(t, err)
 	require.True(t, parsed.Valid)
-	assert.Equal(t, "15555550123", claims["phone_number"])
+	assert.Equal(t, "+15555550123", claims["phone_number"])
 	assert.Equal(t, false, claims["phone_number_verified"])
 	assert.Equal(t, false, claims["phone_verified"])
+}
+
+func TestNormalizeTelegramPhoneNumber(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "digits", raw: "15555550123", want: "+15555550123"},
+		{name: "existing plus", raw: "+15555550123", want: "+15555550123"},
+		{name: "repeated plus", raw: "++15555550123", want: "+15555550123"},
+		{name: "spaced repeated plus", raw: "\t++15555550123 ", want: "+15555550123"},
+		{name: "surrounding whitespace", raw: " 15555550123\t", want: "+15555550123"},
+		{name: "empty"},
+		{name: "whitespace", raw: " \t"},
+		{name: "plus only", raw: "+"},
+		{name: "pluses only", raw: "+++"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizeTelegramPhoneNumber(tt.raw))
+		})
+	}
 }
 
 func TestTelegramIdentityEmailIsReadableAndDeterministic(t *testing.T) {
