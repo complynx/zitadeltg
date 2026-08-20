@@ -161,6 +161,11 @@ const loginHTML = `<!doctype html>
     window.addEventListener("load", function () {
       if (window.Telegram && Telegram.Login && typeof Telegram.Login.init === "function") {
         Telegram.Login.init(loginOptions, submitTelegramAuth);
+        setTimeout(function () {
+          setBusy(true);
+          setStatus("Waiting for Telegram...");
+          Telegram.Login.auth(loginOptions, submitTelegramAuth);
+        }, 100);
       } else {
         setStatus("Telegram login is unavailable. Please reload and try again.", true);
       }
