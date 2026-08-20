@@ -102,6 +102,8 @@ const loginHTML = `<!doctype html>
     const button = document.getElementById("login-button");
     const statusNode = document.getElementById("status");
     const telegramScript = document.getElementById("telegram-login-script");
+    let loginPending = false;
+    let loginRetryTimer = null;
 
     function setStatus(message, isError) {
       statusNode.textContent = message || "";
@@ -113,17 +115,31 @@ const loginHTML = `<!doctype html>
       button.setAttribute("aria-busy", busy ? "true" : "false");
     }
 
+    function clearLoginRetryTimer() {
+      if (loginRetryTimer !== null) {
+        window.clearTimeout(loginRetryTimer);
+        loginRetryTimer = null;
+      }
+    }
+
+    function allowLoginRetry() {
+      clearLoginRetryTimer();
+      loginPending = false;
+      setBusy(false);
+    }
+
     function submitTelegramAuth(result) {
       if (!result || result.error) {
-        setBusy(false);
+        allowLoginRetry();
         setStatus(result && result.error ? result.error : "Telegram login was cancelled.", true);
         return;
       }
       if (!result.id_token) {
-        setBusy(false);
+        allowLoginRetry();
         setStatus("Telegram did not return an ID token.", true);
         return;
       }
+      clearLoginRetryTimer();
       const form = document.createElement("form");
       form.method = "post";
       form.action = authAction;
@@ -143,14 +159,24 @@ const loginHTML = `<!doctype html>
     }
 
     function openTelegramLogin() {
+      if (loginPending) {
+        return;
+      }
       if (!window.Telegram || !Telegram.Login || typeof Telegram.Login.auth !== "function") {
         setBusy(false);
         setStatus("Telegram login is unavailable. Please reload and try again.", true);
         return;
       }
+      loginPending = true;
       setBusy(true);
       setStatus("Waiting for Telegram...");
-      Telegram.Login.auth(loginOptions, submitTelegramAuth);
+      loginRetryTimer = window.setTimeout(allowLoginRetry, 1000);
+      try {
+        Telegram.Login.auth(loginOptions, submitTelegramAuth);
+      } catch (error) {
+        allowLoginRetry();
+        setStatus("Telegram login could not be opened. Please try again.", true);
+      }
     }
 
     button.addEventListener("click", openTelegramLogin);
@@ -161,11 +187,6 @@ const loginHTML = `<!doctype html>
     window.addEventListener("load", function () {
       if (window.Telegram && Telegram.Login && typeof Telegram.Login.init === "function") {
         Telegram.Login.init(loginOptions, submitTelegramAuth);
-        setTimeout(function () {
-          setBusy(true);
-          setStatus("Waiting for Telegram...");
-          Telegram.Login.auth(loginOptions, submitTelegramAuth);
-        }, 100);
       } else {
         setStatus("Telegram login is unavailable. Please reload and try again.", true);
       }
