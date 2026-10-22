@@ -43,6 +43,7 @@ type Server struct {
 	signer        *Signer
 	telegram      *TelegramValidator
 	proxyClient   *http.Client
+	prelinkClient *http.Client
 	loginPage     *template.Template
 	botsByID      map[string]BotConfig
 	loginLimits   *requestLimiter
@@ -62,7 +63,17 @@ func NewServer(ctx context.Context, cfg Config, signer *Signer, httpClient *http
 	if cfg.JWT.Audience == "" {
 		return nil, errors.New("JWT audience is required")
 	}
+	for _, bot := range cfg.Bots {
+		if err := validatePrelink(bot.Prelink, cfg, bot.Secret); err != nil {
+			return nil, err
+		}
+	}
 	httpClient = withDefaultHTTPTimeout(httpClient)
+	prelinkClient := &http.Client{
+		Transport:     httpClient.Transport,
+		Timeout:       min(httpClient.Timeout, prelinkRequestTimeout),
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	logger := slog.Default()
 	if len(loggers) > 0 && loggers[0] != nil {
 		logger = loggers[0]
@@ -91,6 +102,7 @@ func NewServer(ctx context.Context, cfg Config, signer *Signer, httpClient *http
 		signer:        signer,
 		telegram:      telegram,
 		proxyClient:   proxyClient,
+		prelinkClient: prelinkClient,
 		loginPage:     loginPage,
 		botsByID:      bots,
 		loginLimits:   newRequestLimiter(cfg.RateLimit.Login),
@@ -332,10 +344,12 @@ func (s *Server) handleTelegramAuth(w http.ResponseWriter, r *http.Request, botI
 		return
 	}
 	s.debugRequest(r, "telegram auth state accepted", slog.String("bot_id", botID))
-	s.debugRequest(r, "telegram id token received",
-		slog.String("bot_id", botID),
-		slog.String("telegram_jwt_unsigned", unsignedJWT(idToken)),
-	)
+	if bot.Prelink == (PrelinkConfig{}) {
+		s.debugRequest(r, "telegram id token received",
+			slog.String("bot_id", botID),
+			slog.String("telegram_jwt_unsigned", unsignedJWT(idToken)),
+		)
+	}
 	user, err := s.telegram.Validate(r.Context(), idToken, bot.ID, state.Nonce)
 	if err != nil {
 		s.logger.Warn("telegram token validation failed", requestAttrs(r,
@@ -354,18 +368,28 @@ func (s *Server) handleTelegramAuth(w http.ResponseWriter, r *http.Request, botI
 		slog.Bool("username_present", user.PreferredUsername != ""),
 		slog.Bool("phone_present", user.PhoneNumber != ""),
 	)
+	if err := s.prelinkTelegram(r.Context(), bot, user); err != nil {
+		s.logger.Warn("Telegram prelink failed", requestAttrs(r, slog.String("bot_id", botID), slog.Any("error", err))...)
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, errPrelinkDenied) {
+			status = http.StatusForbidden
+		}
+		s.error(w, status, "could not link Telegram account")
+		return
+	}
 	jwt, err := s.issueZitadelJWT(bot, user)
 	if err != nil {
 		s.logger.Error("issue zitadel jwt failed", requestAttrs(r, slog.String("bot_id", botID), slog.Any("error", err))...)
 		s.error(w, http.StatusInternalServerError, "could not issue JWT")
 		return
 	}
+	_, emailVerified := s.relayEmailPolicy(bot)
 	s.debugRequest(r, "zitadel relay jwt issued",
 		slog.String("bot_id", botID),
 		slog.String("issuer", s.cfg.Issuer),
 		slog.String("audience", s.cfg.JWT.Audience),
 		slog.String("key_id", s.cfg.JWT.KeyID),
-		slog.Bool("email_verified", s.cfg.SyntheticEmailVerified),
+		slog.Bool("email_verified", emailVerified),
 	)
 	if err := s.proxyToZitadel(w, r, jwt, state.Query); err != nil {
 		s.logger.Error("zitadel relay failed", requestAttrs(r, slog.String("bot_id", botID), slog.Any("error", err))...)
@@ -406,6 +430,7 @@ func (s *Server) issueZitadelJWT(bot BotConfig, user TelegramUser) (string, erro
 	if authTime > now.Unix() {
 		authTime = now.Unix()
 	}
+	emailDomain, emailVerified := s.relayEmailPolicy(bot)
 	claims := map[string]any{
 		"iss":                             s.cfg.Issuer,
 		"sub":                             "telegram:" + bot.ID + ":" + userID,
@@ -418,8 +443,8 @@ func (s *Server) issueZitadelJWT(bot BotConfig, user TelegramUser) (string, erro
 		"given_name":                      givenName,
 		"family_name":                     familyName,
 		"preferred_username":              username,
-		"email":                           telegramIdentityEmail(bot.ID, telegramID, s.cfg.EmailDomain),
-		"email_verified":                  s.cfg.SyntheticEmailVerified,
+		"email":                           telegramIdentityEmail(bot.ID, telegramID, emailDomain),
+		"email_verified":                  emailVerified,
 		"urn:zitadeltg:telegram:bot_id":   bot.ID,
 		"urn:zitadeltg:telegram:bot_name": bot.Name,
 		"urn:zitadeltg:telegram:subject":  userID,
@@ -545,7 +570,8 @@ func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt stri
 				slog.Bool("registration_sensitive", sensitiveRegistration),
 				slog.Bool("registration_relayed", relayRegistration),
 			}
-			if !sensitiveRegistration {
+			_, relayBotID, _ := matchEndpoint(r.URL.Path, "auth/telegram")
+			if !sensitiveRegistration && s.botsByID[relayBotID].Prelink == (PrelinkConfig{}) {
 				attrs = append(attrs,
 					slog.String("response_body", redactJWTSignatures(diagnosticBody, jwt)),
 					slog.String("jwt_unsigned", unsignedJWT(jwt)),
@@ -1300,4 +1326,12 @@ func (s *Server) error(w http.ResponseWriter, status int, message string) {
 	}
 	w.WriteHeader(status)
 	s.writeBytes(w, []byte(message+"\n"), http.StatusText(status))
+}
+
+// relayEmailPolicy keeps opt-in linking independent of other bots' email settings.
+func (s *Server) relayEmailPolicy(bot BotConfig) (string, bool) {
+	if bot.Prelink != (PrelinkConfig{}) {
+		return "telegram.invalid", true
+	}
+	return s.cfg.EmailDomain, s.cfg.SyntheticEmailVerified
 }

@@ -84,6 +84,10 @@ Coverage includes:
   `502` for these upstream HTML pages; tests check the email diagnostic category
   and the upstream MFA form.
 - Incorrect relay issuer/header and the configured authentication rate limit.
+- Optional prelink against a fixture backend using real IAM provisioning and
+  exact provider-link read-back: both entry orders, concurrent entry, identical
+  retries after a lost completion reply, failures/timeouts, invalid Telegram
+  proofs, sequential login and completed-login process restart.
 
 The suite covers the server-side Login V1 integration. It does not execute the
 external Telegram JavaScript, real Telegram consent, Login V2, email delivery,

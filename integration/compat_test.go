@@ -52,6 +52,8 @@ type harness struct {
 	stopApp      func()
 	appLog       string
 	upstreamBody atomic.Value
+	prelink      atomic.Pointer[prelinkBackend]
+	organization string
 }
 
 type flow struct {
@@ -299,9 +301,9 @@ func TestCompatibility(t *testing.T) {
 
 	t.Run("required_mfa_fails_closed", func(t *testing.T) {
 		h.api(t, "POST", "/admin/v1/policies/login/second_factors", map[string]any{"type": "SECOND_FACTOR_TYPE_OTP"})
-		h.api(t, "PUT", "/admin/v1/policies/login", loginPolicy(true))
+		h.setLoginPolicy(t, true)
 		t.Cleanup(func() {
-			h.api(t, "PUT", "/admin/v1/policies/login", loginPolicy(false))
+			h.setLoginPolicy(t, false)
 			h.api(t, "DELETE", "/admin/v1/policies/login/second_factors/SECOND_FACTOR_TYPE_OTP", nil)
 		})
 		f := h.begin(t, idp)
@@ -359,6 +361,7 @@ func TestCompatibility(t *testing.T) {
 		require.Equal(t, 429, resp.StatusCode, body)
 		require.Equal(t, before, h.relays.Load())
 	})
+	t.Run("prelink", h.testPrelink)
 }
 
 func newHarness(t *testing.T) *harness {
@@ -395,6 +398,14 @@ func newHarness(t *testing.T) *harness {
 		_, _ = w.Write(h.telegram.JWKS())
 	})
 	mux.Handle("/tg/", appProxy)
+	mux.HandleFunc("/internal/identity/telegram-prelink", func(w http.ResponseWriter, r *http.Request) {
+		backend := h.prelink.Load()
+		if backend == nil {
+			http.Error(w, "prelink disabled", 503)
+			return
+		}
+		backend.ServeHTTP(w, r)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/ui/login/login/jwt/authorize" {
 			h.relays.Add(1)
@@ -501,21 +512,40 @@ bots:
 
 func (h *harness) api(t *testing.T, method, path string, body any) map[string]any {
 	t.Helper()
+	// Cleanup callbacks run after the subtest context has been canceled.
+	result, err := h.callAPI(context.Background(), method, path, body)
+	require.NoError(t, err)
+	return result
+}
+
+func (h *harness) callAPI(ctx context.Context, method, path string, body any) (map[string]any, error) {
 	data, err := json.Marshal(body)
-	require.NoError(t, err)
-	req, err := http.NewRequest(method, origin+path, bytes.NewReader(data))
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, origin+path, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Authorization", "Bearer "+h.pat)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := h.client.Do(req)
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	data, err = io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.Less(t, resp.StatusCode, 300, "%s %s: %s", method, path, data)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s %s: status %d: %s", method, path, resp.StatusCode, data)
+	}
 	result := map[string]any{}
-	require.NoError(t, json.Unmarshal(data, &result))
-	return result
+	if err = json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (h *harness) bootstrap() {
@@ -560,7 +590,7 @@ func (h *harness) bootstrap() {
 		return resp.StatusCode == http.StatusOK
 	}, 30*time.Second, 100*time.Millisecond, "tenant projections did not become ready")
 	h.api(t, "PUT", "/v2/features/instance", map[string]any{"loginV2": map[string]any{"required": false}})
-	h.api(t, "PUT", "/admin/v1/policies/login", loginPolicy(false))
+	h.setLoginPolicy(t, false)
 	policy := h.api(t, "GET", "/admin/v1/policies/login", nil)
 	for key, path := range map[string]string{"secondFactors": "second_factors", "multiFactors": "multi_factors"} {
 		if factors, ok := nested(policy, "policy", key).([]any); ok {
@@ -570,6 +600,8 @@ func (h *harness) bootstrap() {
 		}
 	}
 	project := h.api(t, "POST", "/management/v1/projects", map[string]any{"name": "compatibility", "projectRoleCheck": false})
+	organization := h.api(t, "GET", "/management/v1/orgs/me", nil)
+	h.organization = nested(organization, "org", "id").(string)
 	h.projectID = project["id"].(string)
 	application := h.api(t, "POST", "/management/v1/projects/"+h.projectID+"/apps/oidc", map[string]any{
 		"name": "test-client", "redirectUris": []string{"https://application.test/callback"}, "responseTypes": []string{"OIDC_RESPONSE_TYPE_CODE"}, "grantTypes": []string{"OIDC_GRANT_TYPE_AUTHORIZATION_CODE"}, "appType": "OIDC_APP_TYPE_USER_AGENT", "authMethodType": "OIDC_AUTH_METHOD_TYPE_NONE", "loginVersion": map[string]any{"loginV1": map[string]any{}},
@@ -589,7 +621,38 @@ func (h *harness) providerBot(t *testing.T, name string, automatic, update bool,
 	})
 	id := result["id"].(string)
 	h.api(t, "POST", "/admin/v1/policies/login/idps", map[string]any{"idpId": id})
+	h.waitProvider(t, id)
 	return id
+}
+
+func (h *harness) waitProvider(t *testing.T, id string) {
+	t.Helper()
+	// Login reads the asynchronous policy projection. Wait for provisioning
+	// to become visible before creating an auth request that snapshots it.
+	require.Eventually(t, func() bool {
+		result, err := h.callAPI(context.Background(), "POST", "/admin/v1/policies/login/idps/_search", map[string]any{"query": map[string]any{"limit": 100}})
+		if err != nil {
+			return false
+		}
+		links, _ := result["result"].([]any)
+		for _, item := range links {
+			if link, ok := item.(map[string]any); ok && link["idpId"] == id {
+				return true
+			}
+		}
+		return false
+	}, 90*time.Second, 100*time.Millisecond, "provider login-policy projection did not converge")
+}
+
+func (h *harness) setLoginPolicy(t *testing.T, forceMFA bool) {
+	t.Helper()
+	h.api(t, "PUT", "/admin/v1/policies/login", loginPolicy(forceMFA))
+	require.Eventually(t, func() bool {
+		result, err := h.callAPI(context.Background(), "GET", "/admin/v1/policies/login", nil)
+		policy, ok := result["policy"].(map[string]any)
+		actual, _ := policy["forceMfa"].(bool)
+		return err == nil && ok && actual == forceMFA
+	}, 90*time.Second, 100*time.Millisecond, "login-policy projection did not converge")
 }
 
 func (h *harness) human(t *testing.T, name, email string) string {

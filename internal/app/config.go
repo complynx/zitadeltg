@@ -79,6 +79,7 @@ type RateLimitBucketConfig struct {
 }
 
 type BotConfig struct {
+	Prelink      PrelinkConfig
 	ID           string
 	Secret       string
 	Name         string
@@ -157,13 +158,14 @@ type rawRateLimitBucketConfig struct {
 }
 
 type rawBotConfig struct {
-	Token            string `yaml:"token"`
-	Name             string `yaml:"name"`
-	Lang             string `yaml:"lang"`
-	RequestWrite     bool   `yaml:"write"`
-	RequestPhone     bool   `yaml:"phone"`
-	RequestWriteLong bool   `yaml:"request_write"`
-	RequestPhoneLong bool   `yaml:"request_phone"`
+	Prelink          PrelinkConfig `yaml:"prelink"`
+	Token            string        `yaml:"token"`
+	Name             string        `yaml:"name"`
+	Lang             string        `yaml:"lang"`
+	RequestWrite     bool          `yaml:"write"`
+	RequestPhone     bool          `yaml:"phone"`
+	RequestWriteLong bool          `yaml:"request_write"`
+	RequestPhoneLong bool          `yaml:"request_phone"`
 }
 
 type rawConfigPresence struct {
@@ -291,7 +293,9 @@ func (raw *rawConfig) expandEnv() error {
 		&raw.Aliases.TelegramClockSkew,
 	}
 	for i := range raw.Bots {
-		fields = append(fields, &raw.Bots[i].Token, &raw.Bots[i].Name, &raw.Bots[i].Lang)
+		fields = append(fields, &raw.Bots[i].Token, &raw.Bots[i].Name, &raw.Bots[i].Lang,
+			&raw.Bots[i].Prelink.Endpoint, &raw.Bots[i].Prelink.Audience, &raw.Bots[i].Prelink.ServiceBearer,
+			&raw.Bots[i].Prelink.OrganizationID, &raw.Bots[i].Prelink.ProviderID)
 	}
 	for i := range raw.Proxy.TrustedCIDRs {
 		fields = append(fields, &raw.Proxy.TrustedCIDRs[i])
@@ -589,7 +593,11 @@ func finalizeConfig(raw rawConfig) (Config, error) {
 		if name == "" {
 			name = "bot-" + id
 		}
+		if err := validatePrelink(rawBot.Prelink, cfg, secret); err != nil {
+			return Config{}, fmt.Errorf("bots[%d].prelink: %w", i, err)
+		}
 		cfg.Bots = append(cfg.Bots, BotConfig{
+			Prelink:      rawBot.Prelink,
 			ID:           id,
 			Secret:       secret,
 			Name:         name,

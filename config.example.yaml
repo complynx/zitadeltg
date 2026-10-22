@@ -59,6 +59,14 @@ bots:
     write: true
     phone: false
     lang: "en"
+    # Optional account reconciliation after Telegram verification. See
+    # docs/telegram-prelink.md; all five fields are required when enabled.
+    # prelink:
+    #   endpoint: "https://backend.example.com/internal/identity/telegram-prelink"
+    #   audience: "application-telegram-prelink"
+    #   service_bearer: "${TELEGRAM_PRELINK_SERVICE_KEY}"
+    #   organization_id: "ORGANIZATION_ID"
+    #   provider_id: "PROVIDER_ID"
   - token: "${TELEGRAM_BOT_SUPPORT}"
     name: "support_example_bot"
     write: false
