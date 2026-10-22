@@ -245,6 +245,15 @@ against Telegram's current `telegram-login.js?3`; unit tests verify the rendered
 integration contract but cannot detect a breaking change in that external
 script.
 
+## Optional account prelinking
+
+An optional per-bot [prelink hook](docs/telegram-prelink.md) lets a trusted
+application backend provision its canonical account and exact Zitadel provider
+link after Telegram verification and before the IAM relay. A fresh receipt bound
+to that assertion, organization and provider is required; a successful HTTP status
+alone is insufficient. The hook is disabled by default and does not change other
+bots' account-linking behavior.
+
 ## Compatibility tests
 
 Run `bash integration/run.sh` or `pwsh -File integration/run.ps1` to test the
@@ -281,6 +290,9 @@ the Telegram ID token is logged as
 `telegram_jwt_unsigned=header.payload`; its signature is omitted, but the
 remaining value contains the raw encoded identity, profile, phone, nonce, and
 timing claims.
+
+For bots with a prelink hook, identity claim dumps and upstream response/JWT dumps
+are suppressed even at debug level. See the hook's privacy and retry contract.
 
 For a failed ZITADEL relay, `log_level: debug` may additionally log the ZITADEL
 response body (bounded to 32 KiB) and the generated relay JWT as
