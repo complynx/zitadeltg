@@ -1,6 +1,22 @@
 version: 2
 
 updates:
+  - package-ecosystem: "docker-compose"
+    directory: "/integration"
+    ignore:
+      - dependency-name: "pgvector/pgvector"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "test(compat)"
+
+  - package-ecosystem: "docker"
+    directory: "/integration"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "test(runtime)"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

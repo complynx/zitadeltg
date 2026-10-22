@@ -1,0 +1,71 @@
+services:
+  bootstrap:
+    build:
+      context: ..
+      dockerfile: integration/Dockerfile
+    command:
+      - sh
+      - -c
+      - >-
+        openssl genrsa -out /bootstrap/system.key 2048 &&
+        openssl rsa -in /bootstrap/system.key -pubout -out /bootstrap/system.pub &&
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=idp.test
+        -addext subjectAltName=DNS:idp.test -addext basicConstraints=critical,CA:TRUE
+        -keyout /bootstrap/server.key -out /bootstrap/ca.crt
+    volumes:
+      - bootstrap:/bootstrap
+
+  postgres:
+    # Production PostgreSQL 17.9; update manually together with production.
+    image: pgvector/pgvector:pg17@sha256:494dff7e67e7bc2c826b94c331364978d145ebb86fd338154138b084223b7f67
+    environment:
+      POSTGRES_PASSWORD: integration-only
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+    tmpfs: /var/lib/postgresql/data
+
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:v4.20.0
+    user: "0"
+    command: [start-from-init, --masterkey, IntegrationMasterkey32Characters, --tlsMode, external, --config, /test/zitadel.yaml]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    environment:
+      ZITADEL_EXTERNALDOMAIN: idp.test
+      ZITADEL_EXTERNALPORT: 443
+      ZITADEL_EXTERNALSECURE: "true"
+      ZITADEL_DATABASE_POSTGRES_HOST: postgres
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: integration-only
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: integration-only
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      ZITADEL_FIRSTINSTANCE_SKIP: "true"
+      SSL_CERT_FILE: /bootstrap/ca.crt
+    volumes:
+      - bootstrap:/bootstrap
+      - ./zitadel.yaml:/test/zitadel.yaml:ro
+
+  suite:
+    build:
+      context: ..
+      dockerfile: integration/Dockerfile
+    depends_on: [zitadel]
+    environment:
+      SSL_CERT_FILE: /bootstrap/ca.crt
+    volumes:
+      - bootstrap:/bootstrap
+    networks:
+      default:
+        aliases: [idp.test]
+
+volumes:
+  bootstrap:
