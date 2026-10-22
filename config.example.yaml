@@ -4,7 +4,8 @@ public_url: "https://accounts.example.com/tg"
 issuer: "https://accounts.example.com/tg"
 email_domain: "telegram.invalid"
 # ZITADEL Login V1 requires a verified email before completing authentication.
-# Enable only with the reserved .invalid domain and keep email auto-linking disabled.
+# Enable only with the reserved .invalid domain. Email auto-linking requires a
+# controlled provisioning namespace; see the README linking policy.
 synthetic_email_verified: false
 state_ttl: "10m"
 
