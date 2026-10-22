@@ -70,8 +70,9 @@ incoming cookies.
 verified email before it completes authentication, so deployments using
 automatic external-user creation can set it to `true`. This opt-in is accepted
 only when `email_domain` is a subdomain of the reserved `invalid` domain, such
-as `telegram.invalid`. Keep email-based automatic linking disabled: these
-addresses are stable synthetic identifiers, not deliverable mailboxes.
+as `telegram.invalid`. These addresses are stable synthetic identifiers, not
+deliverable mailboxes. Email-based automatic linking can be used for controlled
+account provisioning; see the linking policy below.
 
 If `jwt.private_key_file` is omitted, it defaults to `/data/zitadeltg-rsa.pem`. When
 the configured key file does not exist, the service creates a 2048-bit RSA key
@@ -165,8 +166,7 @@ as well as its documented JSON-number form; both must use the same positive,
 canonical decimal representation within Telegram's 52-bit ID range.
 
 Synthetic addresses are sent with the configured `synthetic_email_verified`
-value; configure ZITADEL to identify users by `sub`, not by matching these
-addresses to existing accounts.
+value. After an account is linked, ZITADEL identifies it by the provider and `sub`.
 The external IdP identity remains `telegram:BOT_ID:OIDC_SUB`; the email is a
 deterministic lookup key for a bot runtime that knows the bot ID and numeric
 Telegram user ID. Existing users with the previous subject-derived address
@@ -192,9 +192,26 @@ Create a JWT IdP in ZITADEL with:
 - Audience: the configured `jwt.audience` (by default the value of
   `zitadel.jwt_endpoint`).
 
-If `synthetic_email_verified` is enabled, disable email-based automatic linking
-on the ZITADEL identity provider. Resolve users by the external issuer and
-`sub`; the asserted email is synthetic and proves no mailbox ownership.
+Choose the initial linking policy explicitly:
+
+- With automatic linking disabled, an existing synthetic email does not prove
+  ownership of an account. Users must link through ZITADEL's authenticated flow.
+- Email-based automatic linking is useful when a trusted importer provisions
+  accounts with `tg+BOT_ID+TELEGRAM_USER_ID@telegram.invalid`. Reserve that
+  namespace for trusted provisioning, prevent users and other IdPs from setting
+  or verifying those addresses, and enable linking only on the intended Telegram
+  JWT providers. The assertion proves control of the Telegram identity through
+  its signed numeric `id`; it does not prove mailbox ownership. Audit imported
+  bot/user mappings before enabling this policy.
+
+Set a non-empty **Audience** on each JWT IdP, equal to `jwt.audience` in this
+service. ZITADEL skips audience validation if the provider's audience is empty.
+The audience identifies the intended consumer; it need not be a reachable URL
+or match the Login V1 callback. For example, keep
+`https://accounts.example.com/idps/jwt` on both sides even when the callback is
+`/ui/login/login/jwt/authorize`. An audience change requires coordinated changes
+to both configurations. Keep the Telegram token's audience (the bot ID) separate
+from this relay JWT audience.
 
 For new users to review and edit their Telegram-supplied first and last names,
 enable manual account creation but disable **Automatic creation** on the JWT
@@ -227,6 +244,14 @@ Before releasing, smoke-test a complete browser login from a registered origin
 against Telegram's current `telegram-login.js?3`; unit tests verify the rendered
 integration contract but cannot detect a breaking change in that external
 script.
+
+## Compatibility tests
+
+Run `bash integration/run.sh` or `pwsh -File integration/run.ps1` to test the
+compiled service against the real Zitadel version pinned in
+`integration/docker-compose.yml`. Dependabot updates that pin; CI runs the suite
+on each PR. See [the integration test guide](integration/README.md) for setup,
+scenario coverage and test boundaries.
 
 ## Security Notes
 

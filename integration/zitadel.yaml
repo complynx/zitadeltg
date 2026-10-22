@@ -1,0 +1,11 @@
+SystemAPIUsers:
+  integration:
+    Path: /bootstrap/system.pub
+    Memberships:
+      - MemberType: System
+        Roles: [SYSTEM_OWNER]
+
+# Test-only: the JWKS server lives on this isolated Compose network.
+# Keep TLS validation enabled and retain the metadata-address block.
+HTTPClient:
+  DenyList: ["169.254.0.0/16"]
