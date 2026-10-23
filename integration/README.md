@@ -84,6 +84,8 @@ Coverage includes:
   `502` for these upstream HTML pages; tests check the email diagnostic category
   and the upstream MFA form.
 - Incorrect relay issuer/header and the configured authentication rate limit.
+- The browser continuation document completes OIDC/PKCE while the consumed
+  browser state remains unusable. This HTTP client check does not execute CSP.
 - Optional prelink against a fixture backend using real IAM provisioning and
   exact provider-link read-back: both entry orders, concurrent entry, identical
   retries after a lost completion reply, failures/timeouts, invalid Telegram

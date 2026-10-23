@@ -325,6 +325,10 @@ func (s *Server) handleTelegramAuth(w http.ResponseWriter, r *http.Request, botI
 		s.error(w, http.StatusBadRequest, "invalid id_token field")
 		return
 	}
+	if values, ok := r.PostForm["navigation"]; ok && (len(values) != 1 || values[0] != "document") {
+		s.error(w, http.StatusBadRequest, "invalid navigation field")
+		return
+	}
 	now := time.Now()
 	state, err := verifyState(bot, encodedState, now, s.cfg.StateTTL)
 	if err != nil {
@@ -580,7 +584,11 @@ func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt stri
 			s.logger.DebugContext(r.Context(), "zitadel relay diagnostics", requestAttrs(r, attrs...)...)
 		}
 		if relayRegistration {
-			return s.relayZitadelRegistration(w, resp, body)
+			if err := s.relayZitadelRegistration(w, resp, body); err != nil {
+				return err
+			}
+			s.logRelayContinuation(r, resp.StatusCode, http.StatusOK, "registration", nil)
+			return nil
 		}
 		s.error(w, http.StatusBadGateway, "unexpected ZITADEL response")
 		if requestID := resp.Header.Get("X-Request-ID"); upstreamRequestIDLogRe.MatchString(requestID) {
@@ -608,12 +616,44 @@ func (s *Server) proxyToZitadel(w http.ResponseWriter, r *http.Request, jwt stri
 		s.error(w, http.StatusBadGateway, "invalid ZITADEL redirect")
 		return errors.New("ZITADEL redirect origin is not allowed")
 	}
+	if r.PostForm.Get("navigation") == "document" {
+		nonce, err := newCSPNonce()
+		if err != nil {
+			s.error(w, http.StatusInternalServerError, "could not prepare navigation")
+			return errors.New("create navigation nonce failed")
+		}
+		var page bytes.Buffer
+		if err := navigationPage.Execute(&page, struct{ Destination, Nonce string }{resolved.String(), nonce}); err != nil {
+			s.error(w, http.StatusInternalServerError, "could not prepare navigation")
+			return errors.New("render navigation page failed")
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'nonce-"+nonce+"'")
+		s.writeBytes(w, page.Bytes(), "navigation page")
+		s.logRelayContinuation(r, resp.StatusCode, http.StatusOK, "document", resolved)
+		return nil
+	}
 	w.Header().Set("Location", resolved.String())
 	w.Header().Set("Cache-Control", "no-store")
 	// The browser posted Telegram credentials to this handler. Always switch to
 	// GET so an upstream 307/308 can never resend that body to the destination.
 	w.WriteHeader(http.StatusSeeOther)
+	s.logRelayContinuation(r, resp.StatusCode, http.StatusSeeOther, "redirect", resolved)
 	return nil
+}
+
+// This records the provider response, not completion of browser/OIDC navigation.
+func (s *Server) logRelayContinuation(r *http.Request, upstreamStatus, responseStatus int, kind string, destination *url.URL) {
+	if s.logger == nil {
+		return
+	}
+	attrs := []slog.Attr{slog.Int("upstream_status", upstreamStatus), slog.Int("response_status", responseStatus),
+		slog.String("continuation", kind), slog.Bool("request_canceled", r.Context().Err() != nil)}
+	if destination != nil {
+		attrs = append(attrs, slog.String("destination_origin", destination.Scheme+"://"+destination.Host), slog.String("destination_path", destination.EscapedPath()))
+	}
+	s.logger.InfoContext(r.Context(), "zitadel relay continuation", requestAttrs(r, attrs...)...)
 }
 
 func (s *Server) zitadelUserAgentCookie(r *http.Request, target *url.URL) (*http.Cookie, bool) {

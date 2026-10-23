@@ -350,6 +350,30 @@ func TestCompatibility(t *testing.T) {
 		})
 	}
 
+	t.Run("browser_navigation_document_completes_oidc", func(t *testing.T) {
+		h.stopApp()
+		h.startApp(t, nil)
+		idp := h.provider(t, "browser-navigation", true, false, "AUTO_LINKING_OPTION_UNSPECIFIED", audience)
+		f := h.begin(t, idp)
+		resp, body := h.authenticate(t, f, "browser-navigation", 3004, nil, nil, "document")
+		require.Equal(t, 200, resp.StatusCode, body)
+		require.Empty(t, resp.Header.Get("Location"))
+		require.Contains(t, resp.Header.Get("Content-Security-Policy"), "form-action 'none'")
+		encoded := javascriptString(t, body, `window.location.replace\(("[^"\n]+")\)`)
+		var destination string
+		require.NoError(t, json.Unmarshal([]byte(encoded), &destination))
+		u, err := url.Parse(destination)
+		require.NoError(t, err)
+		require.Equal(t, "https", u.Scheme)
+		require.Equal(t, "idp.test", u.Host)
+		resp, body = request(t, f.client, "GET", destination, nil)
+		require.NotEmpty(t, h.finish(t, f, resp, body))
+		before := h.relays.Load()
+		resp, body = h.authenticate(t, f, "browser-navigation", 3004, nil, nil, "document")
+		require.Equal(t, 400, resp.StatusCode, body)
+		require.Equal(t, before, h.relays.Load())
+	})
+
 	t.Run("auth_rate_limit", func(t *testing.T) {
 		h.stopApp()
 		h.startApp(t, map[string]string{"  auth:\n    requests: 0": "  auth:\n    requests: 1\n    window: 1m"})
@@ -714,7 +738,7 @@ func (h *harness) begin(t *testing.T, idp string) *flow {
 	return f
 }
 
-func (h *harness) authenticate(t *testing.T, f *flow, subject string, id int, mutate func(map[string]any), signer *app.Signer) (*http.Response, string) {
+func (h *harness) authenticate(t *testing.T, f *flow, subject string, id int, mutate func(map[string]any), signer *app.Signer, navigation ...string) (*http.Response, string) {
 	t.Helper()
 	now := time.Now()
 	claims := map[string]any{"iss": "https://oauth.telegram.org", "aud": f.bot, "sub": subject, "id": id, "iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(), "nonce": f.nonce, "name": "Jane Doe", "given_name": "Jane", "family_name": "Doe", "preferred_username": fmt.Sprintf("u%s-%s-%d", f.idp, f.bot, id), "phone_number": fmt.Sprintf("1555555%04d", id), "phone_number_verified": true}
@@ -726,7 +750,11 @@ func (h *harness) authenticate(t *testing.T, f *flow, subject string, id int, mu
 	}
 	token, err := signer.Sign(claims)
 	require.NoError(t, err)
-	return request(t, f.client, "POST", origin+"/tg/auth/telegram/"+f.bot, url.Values{"state": {f.state}, "id_token": {token}})
+	form := url.Values{"state": {f.state}, "id_token": {token}}
+	if len(navigation) > 0 {
+		form.Set("navigation", navigation[0])
+	}
+	return request(t, f.client, "POST", origin+"/tg/auth/telegram/"+f.bot, form)
 }
 
 // finish requires an actual OIDC authorization code, exchanges it with PKCE,
