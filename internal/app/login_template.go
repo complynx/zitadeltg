@@ -103,7 +103,7 @@ const loginHTML = `<!doctype html>
     const statusNode = document.getElementById("status");
     const telegramScript = document.getElementById("telegram-login-script");
     let loginPending = false;
-    let loginRetryTimer = null;
+    let loginSubmitted = false;
 
     function setStatus(message, isError) {
       statusNode.textContent = message || "";
@@ -115,20 +115,18 @@ const loginHTML = `<!doctype html>
       button.setAttribute("aria-busy", busy ? "true" : "false");
     }
 
-    function clearLoginRetryTimer() {
-      if (loginRetryTimer !== null) {
-        window.clearTimeout(loginRetryTimer);
-        loginRetryTimer = null;
-      }
-    }
-
     function allowLoginRetry() {
-      clearLoginRetryTimer();
+      if (loginSubmitted) {
+        return;
+      }
       loginPending = false;
       setBusy(false);
     }
 
     function submitTelegramAuth(result) {
+      if (loginSubmitted) {
+        return;
+      }
       if (!result || result.error) {
         allowLoginRetry();
         setStatus(result && result.error ? result.error : "Telegram login was cancelled.", true);
@@ -139,7 +137,10 @@ const loginHTML = `<!doctype html>
         setStatus("Telegram did not return an ID token.", true);
         return;
       }
-      clearLoginRetryTimer();
+      loginSubmitted = true;
+      loginPending = true;
+      setBusy(true);
+      setStatus("Completing sign-in...");
       const form = document.createElement("form");
       form.method = "post";
       form.action = authAction;
@@ -152,14 +153,19 @@ const loginHTML = `<!doctype html>
       stateInput.type = "hidden";
       stateInput.name = "state";
       stateInput.value = state;
+      const navigationInput = document.createElement("input");
+      navigationInput.type = "hidden";
+      navigationInput.name = "navigation";
+      navigationInput.value = "document";
       form.appendChild(tokenInput);
       form.appendChild(stateInput);
+      form.appendChild(navigationInput);
       document.body.appendChild(form);
       form.submit();
     }
 
     function openTelegramLogin() {
-      if (loginPending) {
+      if (loginPending || loginSubmitted) {
         return;
       }
       if (!window.Telegram || !Telegram.Login || typeof Telegram.Login.auth !== "function") {
@@ -170,10 +176,12 @@ const loginHTML = `<!doctype html>
       loginPending = true;
       setBusy(true);
       setStatus("Waiting for Telegram...");
-      loginRetryTimer = window.setTimeout(allowLoginRetry, 1000);
       try {
         Telegram.Login.auth(loginOptions, submitTelegramAuth);
       } catch (error) {
+        if (loginSubmitted) {
+          return;
+        }
         allowLoginRetry();
         setStatus("Telegram login could not be opened. Please try again.", true);
       }
@@ -181,7 +189,10 @@ const loginHTML = `<!doctype html>
 
     document.addEventListener("click", openTelegramLogin);
     telegramScript.addEventListener("error", function () {
-      setBusy(false);
+      if (loginSubmitted) {
+        return;
+      }
+      allowLoginRetry();
       setStatus("Telegram login could not be loaded. Please reload and try again.", true);
     });
     window.addEventListener("load", function () {

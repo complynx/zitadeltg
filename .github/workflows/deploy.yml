@@ -38,6 +38,9 @@ jobs:
       - name: Run vet
         run: go vet ./...
 
+      - name: Test login page callbacks
+        run: node --test internal/app/login_template.test.cjs
+
       - name: Build runtime image
         run: docker build --target runtime --tag zitadeltg:ci .
 

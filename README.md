@@ -241,9 +241,24 @@ a proxy sets `Cross-Origin-Opener-Policy: same-origin`, change it to
 the login result.
 
 Before releasing, smoke-test a complete browser login from a registered origin
-against Telegram's current `telegram-login.js?3`; unit tests verify the rendered
-integration contract but cannot detect a breaking change in that external
-script.
+against Telegram's current `telegram-login.js?3`. Run
+`node --test internal/app/login_template.test.cjs` (Node.js 22+) for callback,
+slow-confirmation and cancellation checks with an SDK double. These checks and Go
+rendering tests cannot detect a breaking change in the external SDK.
+
+The page submits at most once. It remains busy while Telegram confirmation is
+pending and after submission; cancellation or an error before submission permits
+retry. A successful browser callback receives a same-origin continuation document
+before the GET navigation to IAM. This prevents the login page's strict
+`form-action 'self'` policy from blocking later cross-origin OIDC redirects.
+Clients that omit the form field `navigation=document` retain the `303` response.
+
+The INFO event `zitadel relay continuation` records the upstream status, provider
+response status, continuation type, destination origin/path and request cancellation.
+It excludes query strings and fragments. This event confirms the provider response;
+only the application's OIDC callback proves completed sign-in. Browser CSP or
+canceled-navigation diagnostics must be captured separately, without tokens,
+cookies, encoded state or authorization codes.
 
 ## Optional account prelinking
 
