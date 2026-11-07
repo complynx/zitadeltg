@@ -19,8 +19,12 @@ bots:
 
 Generate a dedicated random 32-byte secret encoded as unpadded base64url. Do not
 reuse a Telegram or IAM credential. The audience must differ from `jwt.audience`.
-The endpoint must use verified HTTPS, the exact path shown above, and no userinfo,
-query or fragment. The configured organization and provider are expected receipt
+The endpoint uses verified HTTPS by default. On a trusted private container network,
+set `prelink.allow_http: true` to explicitly permit an HTTP backend. Keep the
+endpoint private; the service bearer is carried over that network. This option
+does not change signature, audience, redirect or receipt checks. The endpoint
+requires the exact path shown above and no userinfo, query or fragment.
+The configured organization and provider are expected receipt
 values; they are not browser-selectable targets.
 
 ## Assertion contract
