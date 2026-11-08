@@ -40,6 +40,7 @@ var (
 // PrelinkConfig is per bot so other provider clients retain their existing flow.
 // Only a configured backend can acknowledge a completed identity link.
 type PrelinkConfig struct {
+	AllowHTTP      bool   `yaml:"allow_http"`
 	Endpoint       string `yaml:"endpoint"`
 	Audience       string `yaml:"audience"`
 	ServiceBearer  string `yaml:"service_bearer"`
@@ -52,10 +53,11 @@ func validatePrelink(p PrelinkConfig, cfg Config, botSecret string) error {
 		return nil
 	}
 	endpoint, err := url.Parse(p.Endpoint)
-	if err != nil || len(p.Endpoint) > 2048 || endpoint.Scheme != "https" || endpoint.Hostname() == "" ||
+	if err != nil || len(p.Endpoint) > 2048 ||
+		(endpoint.Scheme != "https" && !(p.AllowHTTP && endpoint.Scheme == "http")) || endpoint.Hostname() == "" ||
 		endpoint.User != nil || endpoint.RawQuery != "" || endpoint.ForceQuery || endpoint.Fragment != "" ||
 		endpoint.Opaque != "" || endpoint.Path != prelinkPath || endpoint.RawPath != "" {
-		return errors.New("prelink requires the exact HTTPS backend endpoint")
+		return errors.New("prelink requires exact backend endpoint; private HTTP needs allow_http")
 	}
 	for _, value := range []string{p.Audience, p.OrganizationID, p.ProviderID} {
 		if !prelinkText(value) {
